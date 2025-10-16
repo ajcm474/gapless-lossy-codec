@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use rodio::{Sink, OutputStream, OutputStreamHandle, Source, Decoder as RodioDecoder};
 use std::time::{Duration, Instant};
-use crossbeam_channel::{bounded, Sender, Receiver};
+use crossbeam_channel::{bounded, Receiver};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Write;
