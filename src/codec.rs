@@ -1,15 +1,16 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde::{Serialize, Deserialize};
 use std::f32::consts::PI;
 use rayon::prelude::*;
 use crossbeam_channel::{Sender, Receiver, bounded};
 use std::time::Instant;
 use std::sync::Arc;
+use rustfft::{FftPlanner, num_complex::Complex};
 
-const FRAME_SIZE: usize = 1024;
-const OVERLAP_SIZE: usize = 128;
-const QUANTIZATION_BITS: u32 = 8;
-const FRAMES_PER_CHUNK: usize = 1000; // Decode in chunks of 1000 frames
+const FRAME_SIZE: usize = 2048;
+const OVERLAP_SIZE: usize = 256;
+const QUANTIZATION_BITS: u32 = 16;
+const FRAMES_PER_CHUNK: usize = 500;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EncodedAudio {
@@ -54,14 +55,26 @@ pub struct AudioChunk {
 
 pub struct Encoder {
     window: Vec<f32>,
+    fft_planner: FftPlanner<f32>,
+}
+
+impl Clone for Encoder {
+    fn clone(&self) -> Self {
+        Encoder {
+            window: self.window.clone(),
+            fft_planner: FftPlanner::new(),
+        }
+    }
 }
 
 impl Encoder {
     pub fn new() -> Self {
         let window = Self::create_window(FRAME_SIZE);
+        let fft_planner = FftPlanner::new();
         
         Encoder {
             window,
+            fft_planner,
         }
     }
     
@@ -75,14 +88,18 @@ impl Encoder {
     }
     
     pub fn encode(&mut self, samples: &[f32], sample_rate: u32, channels: u16) -> Result<EncodedAudio> {
-        println!("Encoding {} samples at {}Hz", samples.len(), sample_rate);
+        println!("Encoding {} samples at {}Hz, {} channels", samples.len(), sample_rate, channels);
         let total_samples = samples.len() as u64;
+        
+        // For stereo, process each channel separately or interleaved
+        // For simplicity, just encode as-is (interleaved if stereo)
         
         // Pad input to frame boundary
         let mut padded_samples = samples.to_vec();
-        let remainder = padded_samples.len() % (FRAME_SIZE - OVERLAP_SIZE);
+        let stride = FRAME_SIZE - OVERLAP_SIZE;
+        let remainder = padded_samples.len() % stride;
         if remainder != 0 {
-            let padding = (FRAME_SIZE - OVERLAP_SIZE) - remainder;
+            let padding = stride - remainder;
             padded_samples.extend(vec![0.0; padding]);
         }
         
@@ -91,7 +108,7 @@ impl Encoder {
         
         // Process frames
         let chunks: Vec<_> = padded_samples
-            .chunks(FRAME_SIZE - OVERLAP_SIZE)
+            .chunks(stride)
             .collect();
         
         println!("Processing {} chunks", chunks.len());
@@ -99,12 +116,14 @@ impl Encoder {
         let frames: Vec<EncodedFrame> = chunks
             .par_iter()
             .map(|chunk| {
+                let mut encoder = self.clone();
                 let mut frame_samples = vec![0.0; FRAME_SIZE];
                 let copy_len = chunk.len().min(FRAME_SIZE);
                 frame_samples[..copy_len].copy_from_slice(&chunk[..copy_len]);
-                self.encode_frame(&frame_samples)
+                encoder.encode_frame(&frame_samples)
             })
             .collect();
+
         
         println!("Encoded {} frames", frames.len());
         
@@ -123,48 +142,57 @@ impl Encoder {
         })
     }
     
-    fn encode_frame(&self, samples: &[f32]) -> EncodedFrame {
+    fn encode_frame(&mut self, samples: &[f32]) -> EncodedFrame {
         // Apply window
         let windowed: Vec<f32> = samples.iter()
             .zip(self.window.iter())
             .map(|(s, w)| s * w)
             .collect();
         
-        // Simplified DCT
+        // MDCT via FFT
+        let mut complex_input: Vec<Complex<f32>> = windowed.iter()
+            .map(|&x| Complex { re: x, im: 0.0 })
+            .collect();
+        
+        let fft = self.fft_planner.plan_fft_forward(FRAME_SIZE);
+        fft.process(&mut complex_input);
+        
+        // Take magnitude of first half (MDCT-like)
         let half_size = FRAME_SIZE / 2;
-        let mut dct_coeffs = vec![0.0; half_size];
+        let mut mdct_coeffs: Vec<f32> = complex_input[..half_size]
+            .iter()
+            .map(|c| c.norm() / (FRAME_SIZE as f32).sqrt())
+            .collect();
         
-        for k in 0..half_size {
-            let mut sum = 0.0;
-            let step = if k < 64 { 1 } else { 4 };
-            for (idx, &sample) in windowed.iter().enumerate().step_by(step) {
-                let angle = PI * k as f32 * (idx as f32 + 0.5) / FRAME_SIZE as f32;
-                sum += sample * angle.cos();
-            }
-            dct_coeffs[k] = sum * (2.0 / FRAME_SIZE as f32).sqrt();
-        }
-        
-        let max_val = dct_coeffs.iter()
+        // Find scale factor
+        let max_val = mdct_coeffs.iter()
             .map(|x| x.abs())
             .fold(0.0f32, f32::max);
         
-        let scale_factor = if max_val > 0.0 {
-            max_val
-        } else {
-            1.0
-        };
+        let scale_factor = if max_val > 0.0 { max_val } else { 1.0 };
         
-        let quantized: Vec<i16> = dct_coeffs.iter()
+        // Quantize with psychoacoustic masking
+        let quantized: Vec<i16> = mdct_coeffs.iter()
             .enumerate()
             .map(|(i, &coeff)| {
-                let freq_factor = 1.0 - (i as f32 / dct_coeffs.len() as f32) * 0.7;
+                let freq_factor = if i < 20 {
+                    1.0
+                } else if i < 1000 {
+                    1.0 - (i as f32 / 2000.0) * 0.3
+                } else {
+                    0.7
+                };
+        
                 let masked_coeff = coeff * freq_factor;
-                
                 let normalized = masked_coeff / scale_factor;
-                let quantized = (normalized * (1 << QUANTIZATION_BITS) as f32) as i16;
-                quantized
+                let quantized = (normalized * ((1 << QUANTIZATION_BITS) - 1) as f32) as i16;
+        
+                let max_val = (1i32 << (QUANTIZATION_BITS - 1)) - 1;
+                let min_val = -max_val - 1;
+                quantized.clamp(min_val as i16, max_val as i16)
             })
             .collect();
+        
         
         EncodedFrame {
             mdct_coeffs: quantized,
@@ -176,14 +204,17 @@ impl Encoder {
 pub struct Decoder {
     window: Vec<f32>,
     overlap_buffer: Vec<f32>,
+    fft_planner: FftPlanner<f32>,
 }
 
 impl Decoder {
     pub fn new() -> Self {
         let window = Encoder::create_window(FRAME_SIZE);
+        let fft_planner = FftPlanner::new();
         Decoder {
             window,
             overlap_buffer: vec![0.0; OVERLAP_SIZE],
+            fft_planner,
         }
     }
     
@@ -192,8 +223,8 @@ impl Decoder {
                            encoded: Arc<EncodedAudio>, 
                            progress_sender: Option<Sender<Progress>>) 
                            -> Receiver<AudioChunk> {
-        let (tx, rx) = bounded(5); // Small buffer of decoded chunks
-        let mut decoder = Decoder::new(); // Create a fresh decoder for the thread
+        let (tx, rx) = bounded(5);
+        let mut decoder = Decoder::new();
         
         std::thread::spawn(move || {
             let start_time = Instant::now();
@@ -201,88 +232,62 @@ impl Decoder {
             
             println!("Starting streaming decode of {} frames", total_frames);
             
-            if let Some(ref sender) = progress_sender {
-                let _ = sender.send(Progress::Status(format!(
-                    "Starting streaming decode of {} frames", 
-                    total_frames
-                )));
-            }
-            
-            let mut chunk_samples = Vec::with_capacity(FRAMES_PER_CHUNK * FRAME_SIZE);
-            let mut total_decoded_samples = 0usize;
+            let mut chunk_samples = Vec::with_capacity(FRAMES_PER_CHUNK * (FRAME_SIZE - OVERLAP_SIZE));
+            let mut total_output_samples = 0usize;
             let mut frames_decoded = 0;
+            let mut is_first_frame = true;
             
             for (idx, frame) in encoded.frames.iter().enumerate() {
                 // Decode frame
                 let frame_samples = decoder.decode_frame_simple(frame);
                 
-                // Handle overlap-add
-                let overlap_len = decoder.overlap_buffer.len().min(frame_samples.len());
-                for i in 0..overlap_len {
-                    chunk_samples.push(decoder.overlap_buffer[i] + frame_samples[i]);
-                }
-                
-                // Add non-overlapping part
-                if frame_samples.len() > OVERLAP_SIZE {
-                    let end = frame_samples.len().saturating_sub(OVERLAP_SIZE);
-                    if OVERLAP_SIZE < end {
-                        chunk_samples.extend_from_slice(&frame_samples[OVERLAP_SIZE..end]);
+                if is_first_frame {
+                    // First frame: output all samples
+                    chunk_samples.extend_from_slice(&frame_samples);
+                    is_first_frame = false;
+                    
+                    // Initialize overlap buffer with end of first frame
+                    let start = frame_samples.len().saturating_sub(OVERLAP_SIZE);
+                    decoder.overlap_buffer.copy_from_slice(&frame_samples[start..]);
+                } else {
+                    // Overlap-add with previous frame
+                    for i in 0..OVERLAP_SIZE {
+                        chunk_samples.push(decoder.overlap_buffer[i] + frame_samples[i]);
                     }
                     
-                    // Update overlap buffer
+                    // Add non-overlapping part
+                    chunk_samples.extend_from_slice(&frame_samples[OVERLAP_SIZE..FRAME_SIZE - OVERLAP_SIZE]);
+                    
+                    // Update overlap buffer with end of current frame
                     let start = frame_samples.len().saturating_sub(OVERLAP_SIZE);
-                    if start < frame_samples.len() && frame_samples.len() >= OVERLAP_SIZE {
-                        decoder.overlap_buffer.copy_from_slice(&frame_samples[start..]);
-                    }
+                    decoder.overlap_buffer.copy_from_slice(&frame_samples[start..]);
                 }
                 
                 frames_decoded += 1;
-                total_decoded_samples += frame_samples.len();
                 
                 // Send chunk when we've decoded enough frames or reached the end
                 if frames_decoded % FRAMES_PER_CHUNK == 0 || idx == total_frames - 1 {
                     let progress = (idx as f32 / total_frames as f32) * 100.0;
-                    
-                    println!("Sending chunk: frames {}-{} ({:.1}%), {} samples", 
-                             idx.saturating_sub(FRAMES_PER_CHUNK - 1), idx, progress, chunk_samples.len());
-                    
-                    if let Some(ref sender) = progress_sender {
-                        let _ = sender.send(Progress::Decoding(progress));
-                        let _ = sender.send(Progress::Status(format!(
-                            "Decoded {}/{} frames ({:.1}%)", 
-                            idx + 1, 
-                            total_frames, 
-                            progress
-                        )));
-                    }
                     
                     // Apply gapless trimming if this is the last chunk
                     let mut samples_to_send = chunk_samples.clone();
                     let is_last = idx == total_frames - 1;
                     
                     if is_last {
-                        // Apply gapless trimming to the entire output
-                        let start = encoded.gapless_info.encoder_delay as usize;
-                        let original_length = encoded.gapless_info.original_length as usize;
+                        // Calculate total samples we should have output
+                        let expected_samples = encoded.gapless_info.original_length as usize;
+                        let samples_before_this_chunk = total_output_samples;
                         
-                        // Calculate how many samples we've sent so far (excluding this chunk)
-                        let previously_sent = total_decoded_samples - samples_to_send.len();
-                        
-                        // Trim the current chunk if needed
-                        if previously_sent < original_length {
-                            let chunk_end = (original_length - previously_sent).min(samples_to_send.len());
-                            if start > previously_sent {
-                                let chunk_start = start - previously_sent;
-                                if chunk_start < chunk_end {
-                                    samples_to_send = samples_to_send[chunk_start..chunk_end].to_vec();
-                                }
-                            } else {
-                                samples_to_send.truncate(chunk_end);
-                            }
+                        // Trim to exact length
+                        if samples_before_this_chunk < expected_samples {
+                            let samples_needed = expected_samples - samples_before_this_chunk;
+                            samples_to_send.truncate(samples_needed);
                         }
                         
-                        println!("Last chunk: applied gapless trimming");
+                        println!("Last chunk: trimmed to {} samples", samples_to_send.len());
                     }
+                    
+                    total_output_samples += samples_to_send.len();
                     
                     // Send the chunk
                     if let Err(e) = tx.send(AudioChunk { 
@@ -295,20 +300,10 @@ impl Decoder {
                     
                     // Clear chunk buffer for next batch
                     chunk_samples.clear();
-                    chunk_samples.reserve(FRAMES_PER_CHUNK * FRAME_SIZE);
                 }
             }
             
-            let total_time = start_time.elapsed();
-            println!("Streaming decode complete: {} frames in {:.2}s", total_frames, total_time.as_secs_f32());
-            
-            if let Some(ref sender) = progress_sender {
-                let _ = sender.send(Progress::Complete(format!(
-                    "Decode complete: {} frames in {:.2}s", 
-                    total_frames,
-                    total_time.as_secs_f32()
-                )));
-            }
+            println!("Streaming decode complete: output {} total samples", total_output_samples);
         });
         
         rx
@@ -334,38 +329,40 @@ impl Decoder {
         self.overlap_buffer.fill(0.0);
     }
     
-    fn decode_frame_simple(&self, frame: &EncodedFrame) -> Vec<f32> {
+    fn decode_frame_simple(&mut self, frame: &EncodedFrame) -> Vec<f32> {
         let half_size = frame.mdct_coeffs.len();
-        let full_size = half_size * 2;
         
         // Dequantize
-        let dct_coeffs: Vec<f32> = frame.mdct_coeffs.iter()
-            .map(|&q| {
-                let normalized = q as f32 / (1 << QUANTIZATION_BITS) as f32;
+        let mdct_coeffs: Vec<f32> = frame.mdct_coeffs.iter()
+            .enumerate()
+            .map(|(i, &q)| {
+                let normalized = q as f32 / ((1 << QUANTIZATION_BITS) - 1) as f32;
                 normalized * frame.scale_factor
             })
             .collect();
         
-        // Simple IDCT
-        let mut samples = vec![0.0; full_size];
+        // IMDCT via IFFT
+        let mut complex_spectrum = vec![Complex { re: 0.0, im: 0.0 }; FRAME_SIZE];
         
-        for n in 0..full_size {
-            let mut sum = 0.0;
-            let step = if n < 256 { 1 } else { 2 };
-            
-            for (k, &coeff) in dct_coeffs.iter().enumerate().step_by(step) {
-                let angle = PI * k as f32 * (n as f32 + 0.5) / full_size as f32;
-                sum += coeff * angle.cos();
-            }
-            samples[n] = sum * (2.0 / full_size as f32).sqrt();
-        }
-        
-        // Apply window
-        for (i, sample) in samples.iter_mut().enumerate() {
-            if i < self.window.len() {
-                *sample *= self.window[i];
+        // Fill positive frequencies
+        for (i, &coeff) in mdct_coeffs.iter().enumerate() {
+            if i < half_size {
+                complex_spectrum[i] = Complex { re: coeff, im: 0.0 };
+                // Mirror for negative frequencies
+                if i > 0 && i < half_size {
+                    complex_spectrum[FRAME_SIZE - i] = Complex { re: coeff, im: 0.0 };
+                }
             }
         }
+        
+        let ifft = self.fft_planner.plan_fft_inverse(FRAME_SIZE);
+        ifft.process(&mut complex_spectrum);
+        
+        // Take real part and apply window
+        let mut samples: Vec<f32> = complex_spectrum.iter()
+            .zip(self.window.iter())
+            .map(|(c, &w)| c.re * w)
+            .collect();
         
         samples
     }

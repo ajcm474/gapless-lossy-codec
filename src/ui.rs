@@ -6,10 +6,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use rodio::{Sink, OutputStream, OutputStreamHandle, Source, Decoder as RodioDecoder};
 use std::time::{Duration, Instant};
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::{bounded, Sender, Receiver};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct CodecApp {
     selected_files: Vec<PathBuf>,
@@ -20,10 +21,11 @@ pub struct CodecApp {
     is_playing: bool,
     is_testing: bool,
     current_track: usize,
-    audio_sink: Option<Sink>,
+    audio_sink: Option<Arc<Mutex<Sink>>>,
     test_sink: Option<Sink>,
     _stream: Option<OutputStream>,
     stream_handle: Option<OutputStreamHandle>,
+    playback_stop_signal: Arc<AtomicBool>,
     
     // Progress tracking
     export_progress: Arc<Mutex<Option<f32>>>,
@@ -57,6 +59,7 @@ impl CodecApp {
             test_sink: None,
             _stream: Some(stream),
             stream_handle: Some(stream_handle),
+            playback_stop_signal: Arc::new(AtomicBool::new(false)),
             export_progress: Arc::new(Mutex::new(None)),
             encoding_progress: Arc::new(Mutex::new(None)),
             progress_receiver: None,
@@ -144,27 +147,40 @@ impl CodecApp {
         
         self.stop_playback();
         
+        // Reset stop signal for new playback
+        self.playback_stop_signal.store(false, Ordering::Relaxed);
+        
         let playlist = self.playlist.clone();
         let status = self.status.clone();
         let detailed_status = self.detailed_status.clone();
         let stream_handle = self.stream_handle.as_ref().unwrap().clone();
+        let stop_signal = self.playback_stop_signal.clone();
+        
+        let sink = match Sink::try_new(&stream_handle) {
+            Ok(s) => Arc::new(Mutex::new(s)),
+            Err(e) => {
+                self.update_status(format!("Failed to create audio sink: {}", e));
+                return;
+            }
+        };
+        
+        self.audio_sink = Some(sink.clone());  // Store the sink
+        self.is_playing = true;
         
         thread::spawn(move || {
             let start_time = Instant::now();
             *status.lock().unwrap() = "Creating audio sink...".to_string();
             
-            let sink = match Sink::try_new(&stream_handle) {
-                Ok(s) => s,
-                Err(e) => {
-                    *status.lock().unwrap() = format!("Failed to create audio sink: {}", e);
-                    return;
-                }
-            };
-            
             let mut sample_rate = 44100;
+            let mut channels = 2;
             
             // Stream decode and play each track
-            for (idx, path) in playlist.iter().enumerate() {
+            'playlist_loop: for (idx, path) in playlist.iter().enumerate() {
+                // check if we should stop
+                if stop_signal.load(Ordering::Relaxed) {
+                    break 'playlist_loop;
+                }
+                
                 *status.lock().unwrap() = format!("Loading file {}/{}", idx + 1, playlist.len());
                 
                 match load_encoded(path) {
@@ -176,6 +192,7 @@ impl CodecApp {
                         );
                         
                         sample_rate = encoded.header.sample_rate;
+                        channels = encoded.header.channels;
                         let mut decoder = Decoder::new();
                         let arc_encoded = Arc::new(encoded);
                         
@@ -187,6 +204,11 @@ impl CodecApp {
                         
                         // Process chunks as they arrive
                         while let Ok(chunk) = chunk_receiver.recv() {
+                            // Check if we should stop
+                            if stop_signal.load(Ordering::Relaxed) {
+                                break 'playlist_loop;
+                            }
+                            
                             // Update status from decoder
                             while let Ok(progress) = rx.try_recv() {
                                 match progress {
@@ -211,8 +233,8 @@ impl CodecApp {
                             }
                             
                             // Create source from chunk and append to sink
-                            let source = SamplesSource::new(chunk.samples, sample_rate);
-                            sink.append(source);
+                            let source = SamplesSource::new(chunk.samples, sample_rate, channels);
+                            sink.lock().unwrap().append(source);
                             
                             if chunk.is_last {
                                 break;
@@ -229,12 +251,10 @@ impl CodecApp {
             let total_time = start_time.elapsed();
             *status.lock().unwrap() = format!("Playing playlist (prepared in {:.2}s)", total_time.as_secs_f32());
             
-            sink.sleep_until_end();
+            sink.lock().unwrap().sleep_until_end();
             
             *status.lock().unwrap() = "Playback finished".to_string();
         });
-        
-        self.is_playing = true;
     }
     
     fn export_playlist_async(&mut self, output_path: PathBuf) {
@@ -383,8 +403,11 @@ impl CodecApp {
     }
     
     fn stop_playback(&mut self) {
+        // Signal the playback thread to stop
+        self.playback_stop_signal.store(true, Ordering::Relaxed);
+        
         if let Some(sink) = self.audio_sink.take() {
-            sink.stop();
+            sink.lock().unwrap().stop();
         }
         self.is_playing = false;
         self.update_status("Stopped".to_string());
@@ -590,14 +613,16 @@ impl eframe::App for CodecApp {
 struct SamplesSource {
     samples: Vec<f32>,
     sample_rate: u32,
+    channels: u16,
     position: usize,
 }
 
 impl SamplesSource {
-    fn new(samples: Vec<f32>, sample_rate: u32) -> Self {
+    fn new(samples: Vec<f32>, sample_rate: u32, channels: u16) -> Self {
         Self {
             samples,
             sample_rate,
+            channels,
             position: 0,
         }
     }
@@ -623,7 +648,7 @@ impl Source for SamplesSource {
     }
     
     fn channels(&self) -> u16 {
-        1
+        self.channels
     }
     
     fn sample_rate(&self) -> u32 {
@@ -632,7 +657,7 @@ impl Source for SamplesSource {
     
     fn total_duration(&self) -> Option<Duration> {
         Some(Duration::from_secs_f32(
-            self.samples.len() as f32 / self.sample_rate as f32
+            self.samples.len() as f32 / (self.sample_rate as f32 * self.channels as f32)
         ))
     }
 }

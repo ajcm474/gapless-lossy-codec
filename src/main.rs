@@ -3,7 +3,6 @@ mod ui;
 mod audio;
 
 use eframe::egui;
-//use std::sync::{Arc, Mutex};
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
