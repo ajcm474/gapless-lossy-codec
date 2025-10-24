@@ -11,7 +11,8 @@ use std::fs::File;
 use std::io::BufReader;
 use std::io::Write;
 
-pub struct CodecApp {
+pub struct CodecApp 
+{
     selected_files: Vec<PathBuf>,
     encoded_files: Vec<(PathBuf, EncodedAudio)>,
     playlist: Vec<PathBuf>,
@@ -38,13 +39,17 @@ pub struct CodecApp {
     selected_device: usize,
 }
 
-impl CodecApp {
-    pub fn new() -> Self {
-        let (stream, stream_handle) = OutputStream::try_default().unwrap_or_else(|_| {
+impl CodecApp 
+{
+    pub fn new() -> Self 
+    {
+        let (stream, stream_handle) = OutputStream::try_default().unwrap_or_else(|_| 
+        {
             panic!("Failed to get default audio output device");
         });
         
-        Self {
+        Self 
+        {
             selected_files: Vec::new(),
             encoded_files: Vec::new(),
             playlist: Vec::new(),
@@ -66,25 +71,30 @@ impl CodecApp {
         }
     }
     
-    fn update_status(&self, msg: String) {
+    fn update_status(&self, msg: String) 
+    {
         *self.status.lock().unwrap() = msg;
     }
     
-    fn update_detailed_status(&self, msg: String) {
+    fn update_detailed_status(&self, msg: String) 
+    {
         *self.detailed_status.lock().unwrap() = msg;
     }
     
-    fn encode_file_async(&mut self, input_path: PathBuf) {
+    fn encode_file_async(&mut self, input_path: PathBuf) 
+    {
         let status = self.status.clone();
         let detailed_status = self.detailed_status.clone();
         let encoding_progress = self.encoding_progress.clone();
         
-        thread::spawn(move || {
+        thread::spawn(move || 
+        {
             let start_time = Instant::now();
             *status.lock().unwrap() = format!("Loading: {:?}", input_path.file_name().unwrap());
             *encoding_progress.lock().unwrap() = Some(0.0);
             
-            let result = (|| -> anyhow::Result<(PathBuf, EncodedAudio, f32)> {
+            let result = (|| -> anyhow::Result<(PathBuf, EncodedAudio, f32)> 
+            {
                 let load_start = Instant::now();
                 let (samples, sample_rate, channels) = load_audio_file(&input_path)?;
                 *detailed_status.lock().unwrap() = format!(
@@ -119,15 +129,18 @@ impl CodecApp {
             })();
             
             let total_time = start_time.elapsed();
-            match result {
-                Ok((output_path, encoded, ratio)) => {
+            match result 
+            {
+                Ok((output_path, encoded, ratio)) => 
+                {
                     *status.lock().unwrap() = format!(
                         "Encoded successfully! Ratio: {:.2}x, Time: {:.2}s", 
                         ratio, 
                         total_time.as_secs_f32()
                     );
                 }
-                Err(e) => {
+                Err(e) => 
+                {
                     *status.lock().unwrap() = format!("Encoding error: {}", e);
                 }
             }
@@ -136,8 +149,10 @@ impl CodecApp {
         });
     }
     
-    fn play_playlist_async(&mut self) {
-        if self.playlist.is_empty() {
+    fn play_playlist_async(&mut self) 
+    {
+        if self.playlist.is_empty() 
+        {
             self.update_status("Playlist is empty".to_string());
             return;
         }
@@ -150,9 +165,11 @@ impl CodecApp {
         let detailed_status = self.detailed_status.clone();
         let stream_handle = self.stream_handle.as_ref().unwrap().clone();
         
-        let sink = match Sink::try_new(&stream_handle) {
+        let sink = match Sink::try_new(&stream_handle) 
+        {
             Ok(s) => Arc::new(Mutex::new(s)),
-            Err(e) => {
+            Err(e) => 
+            {
                 self.update_status(format!("Failed to create audio sink: {}", e));
                 return;
             }
@@ -164,7 +181,8 @@ impl CodecApp {
         let is_playing = Arc::new(Mutex::new(true));  // Add playing flag
         let is_playing_clone = is_playing.clone();
         
-        thread::spawn(move || {
+        thread::spawn(move || 
+        {
             let start_time = Instant::now();
             *status.lock().unwrap() = "Creating audio sink...".to_string();
             
@@ -172,16 +190,20 @@ impl CodecApp {
             let mut channels = 2;
             
             // Stream decode and play each track
-            for (idx, path) in playlist.iter().enumerate() {
+            for (idx, path) in playlist.iter().enumerate() 
+            {
                 // Check if we should stop
-                if !*is_playing_clone.lock().unwrap() {
+                if !*is_playing_clone.lock().unwrap() 
+                {
                     break;
                 }
                 
                 *status.lock().unwrap() = format!("Loading file {}/{}", idx + 1, playlist.len());
                 
-                match load_encoded(path) {
-                    Ok(encoded) => {
+                match load_encoded(path) 
+                {
+                    Ok(encoded) => 
+                    {
                         *detailed_status.lock().unwrap() = format!(
                             "Streaming {:?}: {} frames",
                             path.file_name().unwrap(),
@@ -190,7 +212,7 @@ impl CodecApp {
                         
                         sample_rate = encoded.header.sample_rate;
                         channels = encoded.header.channels;
-                        let mut decoder = Decoder::new();
+                        let mut decoder = Decoder::new(channels as usize);
                         let arc_encoded = Arc::new(encoded);
                         
                         let (tx, rx) = bounded(10);
@@ -198,18 +220,24 @@ impl CodecApp {
                         
                         let mut first_chunk = true;
                         
-                        while let Ok(chunk) = chunk_receiver.recv() {
+                        while let Ok(chunk) = chunk_receiver.recv() 
+                        {
                             // Check if we should stop
-                            if !*is_playing_clone.lock().unwrap() {
+                            if !*is_playing_clone.lock().unwrap() 
+                            {
                                 break;
                             }
                             
-                            while let Ok(progress) = rx.try_recv() {
-                                match progress {
-                                    Progress::Status(msg) => {
+                            while let Ok(progress) = rx.try_recv() 
+                            {
+                                match progress 
+                                {
+                                    Progress::Status(msg) => 
+                                    {
                                         *detailed_status.lock().unwrap() = msg;
                                     }
-                                    Progress::Decoding(p) => {
+                                    Progress::Decoding(p) => 
+                                    {
                                         *status.lock().unwrap() = format!(
                                             "Playing track {}/{} ({:.0}%)", 
                                             idx + 1, 
@@ -221,7 +249,8 @@ impl CodecApp {
                                 }
                             }
                             
-                            if first_chunk {
+                            if first_chunk 
+                            {
                                 *status.lock().unwrap() = format!("Started playback of track {}/{}", idx + 1, playlist.len());
                                 first_chunk = false;
                             }
@@ -229,12 +258,14 @@ impl CodecApp {
                             let source = SamplesSource::new(chunk.samples, sample_rate, channels);
                             sink.lock().unwrap().append(source);
                             
-                            if chunk.is_last {
+                            if chunk.is_last 
+                            {
                                 break;
                             }
                         }
                     }
-                    Err(e) => {
+                    Err(e) => 
+                    {
                         *status.lock().unwrap() = format!("Error loading file: {}", e);
                         return;
                     }
@@ -251,21 +282,25 @@ impl CodecApp {
         });
     }
     
-    fn export_playlist_async(&mut self, output_path: PathBuf) {
+    fn export_playlist_async(&mut self, output_path: PathBuf) 
+    {
         let playlist = self.playlist.clone();
         let status = self.status.clone();
         let detailed_status = self.detailed_status.clone();
         let export_progress = self.export_progress.clone();
         
-        thread::spawn(move || {
+        thread::spawn(move || 
+        {
             let start_time = Instant::now();
             *export_progress.lock().unwrap() = Some(0.0);
             *status.lock().unwrap() = "Starting export...".to_string();
             
             // Open output file
-            let mut output_file = match std::fs::File::create(&output_path) {
+            let mut output_file = match std::fs::File::create(&output_path) 
+            {
                 Ok(f) => f,
-                Err(e) => {
+                Err(e) => 
+                {
                     *status.lock().unwrap() = format!("Failed to create output file: {}", e);
                     *export_progress.lock().unwrap() = None;
                     return;
@@ -275,34 +310,42 @@ impl CodecApp {
             let total_files = playlist.len();
             let mut total_samples_written = 0;
             
-            for (file_idx, path) in playlist.iter().enumerate() {
+            for (file_idx, path) in playlist.iter().enumerate() 
+            {
                 let base_progress = (file_idx as f32 / total_files as f32) * 100.0;
                 *export_progress.lock().unwrap() = Some(base_progress);
                 *status.lock().unwrap() = format!("Loading file {}/{}", file_idx + 1, total_files);
                 
-                match load_encoded(path) {
-                    Ok(encoded) => {
+                match load_encoded(path) 
+                {
+                    Ok(encoded) => 
+                    {
                         *detailed_status.lock().unwrap() = format!(
                             "Processing {:?}: {} frames",
                             path.file_name().unwrap(),
                             encoded.frames.len()
                         );
                         
-                        let mut decoder = Decoder::new();
+                        let mut decoder = Decoder::new(encoded.header.channels as usize);
                         let arc_encoded = Arc::new(encoded);
                         let (tx, rx) = bounded(10);
                         let chunk_receiver = decoder.decode_streaming(arc_encoded, Some(tx));
                         
                         // Process and write chunks as they arrive
-                        while let Ok(chunk) = chunk_receiver.recv() {
+                        while let Ok(chunk) = chunk_receiver.recv() 
+                        {
                             // Update progress
-                            while let Ok(progress) = rx.try_recv() {
-                                match progress {
-                                    Progress::Decoding(p) => {
+                            while let Ok(progress) = rx.try_recv() 
+                            {
+                                match progress 
+                                {
+                                    Progress::Decoding(p) => 
+                                    {
                                         let overall = base_progress + (p / 100.0) * (100.0 / total_files as f32);
                                         *export_progress.lock().unwrap() = Some(overall);
                                     }
-                                    Progress::Status(msg) => {
+                                    Progress::Status(msg) => 
+                                    {
                                         *detailed_status.lock().unwrap() = msg;
                                     }
                                     _ => {}
@@ -317,7 +360,8 @@ impl CodecApp {
                                 })
                                 .collect();
                             
-                            if let Err(e) = output_file.write_all(&bytes) {
+                            if let Err(e) = output_file.write_all(&bytes) 
+                            {
                                 *status.lock().unwrap() = format!("Error writing to file: {}", e);
                                 *export_progress.lock().unwrap() = None;
                                 return;
@@ -331,12 +375,14 @@ impl CodecApp {
                                 total_files
                             );
                             
-                            if chunk.is_last {
+                            if chunk.is_last 
+                            {
                                 break;
                             }
                         }
                     }
-                    Err(e) => {
+                    Err(e) => 
+                    {
                         *status.lock().unwrap() = format!("Error loading file: {}", e);
                         *export_progress.lock().unwrap() = None;
                         return;
@@ -356,18 +402,26 @@ impl CodecApp {
         });
     }
     
-    fn test_audio_device(&mut self) {
-        if let Some(ref path) = self.test_file_path.clone() {
+    fn test_audio_device(&mut self) 
+    {
+        if let Some(ref path) = self.test_file_path.clone() 
+        {
             self.stop_test_playback();
             
-            if let Some(ref stream_handle) = self.stream_handle {
-                match Sink::try_new(stream_handle) {
-                    Ok(sink) => {
+            if let Some(ref stream_handle) = self.stream_handle 
+            {
+                match Sink::try_new(stream_handle) 
+                {
+                    Ok(sink) => 
+                    {
                         // Try to play the test file
-                        if let Ok(file) = File::open(&path) {
-                            let source = match RodioDecoder::new(BufReader::new(file)) {
+                        if let Ok(file) = File::open(&path) 
+                        {
+                            let source = match RodioDecoder::new(BufReader::new(file)) 
+                            {
                                 Ok(decoder) => decoder,
-                                Err(e) => {
+                                Err(e) => 
+                                {
                                     self.update_status(format!("Failed to decode test file: {}", e));
                                     return;
                                 }
@@ -377,11 +431,13 @@ impl CodecApp {
                             self.test_sink = Some(sink);
                             self.is_testing = true;
                             self.update_status(format!("Playing test file: {:?}", path.file_name().unwrap()));
-                        } else {
+                        } else 
+                        {
                             self.update_status("Failed to open test file".to_string());
                         }
                     }
-                    Err(e) => {
+                    Err(e) => 
+                    {
                         self.update_status(format!("Failed to create sink: {}", e));
                     }
                 }
@@ -389,15 +445,19 @@ impl CodecApp {
         }
     }
     
-    fn stop_test_playback(&mut self) {
-        if let Some(sink) = self.test_sink.take() {
+    fn stop_test_playback(&mut self) 
+    {
+        if let Some(sink) = self.test_sink.take() 
+        {
             sink.stop();
         }
         self.is_testing = false;
     }
     
-    fn stop_playback(&mut self) {
-        if let Some(sink) = self.audio_sink.take() {
+    fn stop_playback(&mut self) 
+    {
+        if let Some(sink) = self.audio_sink.take() 
+        {
             let sink_guard = sink.lock().unwrap();
             sink_guard.stop();
             drop(sink_guard);  // Explicitly drop to ensure cleanup
@@ -407,20 +467,26 @@ impl CodecApp {
     }
 }
 
-impl eframe::App for CodecApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl eframe::App for CodecApp 
+{
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) 
+    {
         // Request repaint for progress updates
         ctx.request_repaint_after(Duration::from_millis(100));
         
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ctx, |ui| 
+        {
             ui.heading("Gapless Audio Codec");
             
             ui.separator();
             
             // Audio Device Testing Section
-            ui.collapsing("Audio Device Testing", |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Select FLAC Test File").clicked() {
+            ui.collapsing("Audio Device Testing", |ui| 
+            {
+                ui.horizontal(|ui| 
+                {
+                    if ui.button("Select FLAC Test File").clicked() 
+                    {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("FLAC files", &["flac"])
                             .pick_file()
@@ -429,19 +495,25 @@ impl eframe::App for CodecApp {
                         }
                     }
                     
-                    if let Some(ref path) = self.test_file_path {
+                    if let Some(ref path) = self.test_file_path 
+                    {
                         ui.label(format!("Test file: {:?}", path.file_name().unwrap()));
                     }
                 });
                 
-                if self.test_file_path.is_some() {
-                    ui.horizontal(|ui| {
-                        if !self.is_testing {
+                if self.test_file_path.is_some()
+                {
+                    ui.horizontal(|ui| 
+                    {
+                        if !self.is_testing 
+                        {
                             if ui.button("▶ Test Audio Output").clicked() {
                                 self.test_audio_device();
                             }
-                        } else {
-                            if ui.button("⏹ Stop Test").clicked() {
+                        } else 
+                        {
+                            if ui.button("⏹ Stop Test").clicked() 
+                            {
                                 self.stop_test_playback();
                                 self.update_status("Test playback stopped".to_string());
                             }
@@ -454,7 +526,8 @@ impl eframe::App for CodecApp {
             
             // File selection section
             ui.horizontal(|ui| {
-                if ui.button("Select Audio Files (WAV/FLAC)").clicked() {
+                if ui.button("Select Audio Files (WAV/FLAC)").clicked() 
+                {
                     if let Some(paths) = rfd::FileDialog::new()
                         .add_filter("Audio files", &["wav", "flac"])
                         .pick_files()
@@ -463,22 +536,28 @@ impl eframe::App for CodecApp {
                     }
                 }
                 
-                if !self.selected_files.is_empty() {
+                if !self.selected_files.is_empty() 
+                {
                     ui.label(format!("{} files selected", self.selected_files.len()));
                 }
             });
             
             // Encode button
-            if !self.selected_files.is_empty() {
-                ui.horizontal(|ui| {
-                    if ui.button("Encode Selected Files").clicked() {
-                        for file in self.selected_files.clone() {
+            if !self.selected_files.is_empty() 
+            {
+                ui.horizontal(|ui| 
+                {
+                    if ui.button("Encode Selected Files").clicked() 
+                    {
+                        for file in self.selected_files.clone() 
+                        {
                             self.encode_file_async(file);
                         }
                     }
                     
                     // Show encoding progress
-                    if let Some(progress) = *self.encoding_progress.lock().unwrap() {
+                    if let Some(progress) = *self.encoding_progress.lock().unwrap() 
+                    {
                         ui.add(egui::ProgressBar::new(progress / 100.0)
                             .text(format!("{:.0}%", progress)));
                     }
@@ -488,13 +567,16 @@ impl eframe::App for CodecApp {
             ui.separator();
             
             // Load encoded files
-            if ui.button("Load Encoded Files (.glc)").clicked() {
+            if ui.button("Load Encoded Files (.glc)").clicked() 
+            {
                 if let Some(paths) = rfd::FileDialog::new()
                     .add_filter("Encoded files", &["glc"])
                     .pick_files()
                 {
-                    for path in paths {
-                        if let Ok(encoded) = load_encoded(&path) {
+                    for path in paths 
+                    {
+                        if let Ok(encoded) = load_encoded(&path) 
+                        {
                             self.encoded_files.push((path, encoded));
                         }
                     }
@@ -506,17 +588,22 @@ impl eframe::App for CodecApp {
             egui::ScrollArea::vertical()
                 .id_source("encoded_files_scroll")
                 .max_height(120.0)
-                .show(ui, |ui| {
+                .show(ui, |ui| 
+                {
                     let mut files_to_add = Vec::new();
-                    for (path, _) in &self.encoded_files {
-                        ui.horizontal(|ui| {
+                    for (path, _) in &self.encoded_files 
+                    {
+                        ui.horizontal(|ui| 
+                        {
                             ui.label(format!("{:?}", path.file_name().unwrap()));
-                            if ui.button(format!("Add##{:?}", path)).clicked() {
+                            if ui.button(format!("Add##{:?}", path)).clicked() 
+                            {
                                 files_to_add.push(path.clone());
                             }
                         });
                     }
-                    for path in files_to_add {
+                    for path in files_to_add 
+                    {
                         self.playlist.push(path);
                     }
                 });
@@ -528,24 +615,31 @@ impl eframe::App for CodecApp {
             egui::ScrollArea::vertical()
                 .id_source("playlist_scroll")
                 .max_height(120.0)
-                .show(ui, |ui| {
+                .show(ui, |ui| 
+                {
                     let mut to_remove = None;
-                    for (i, path) in self.playlist.iter().enumerate() {
+                    for (i, path) in self.playlist.iter().enumerate() 
+                    {
                         ui.horizontal(|ui| {
                             ui.label(format!("{}. {:?}", i + 1, path.file_name().unwrap()));
-                            if ui.button(format!("Remove##{}", i)).clicked() {
+                            if ui.button(format!("Remove##{}", i)).clicked() 
+                            {
                                 to_remove = Some(i);
                             }
                         });
                     }
-                    if let Some(idx) = to_remove {
+                    if let Some(idx) = to_remove 
+                    {
                         self.playlist.remove(idx);
                     }
                 });
             
-            ui.horizontal(|ui| {
-                if !self.playlist.is_empty() {
-                    if ui.button("Clear Playlist").clicked() {
+            ui.horizontal(|ui| 
+            {
+                if !self.playlist.is_empty() 
+                {
+                    if ui.button("Clear Playlist").clicked() 
+                    {
                         self.playlist.clear();
                     }
                 }
@@ -554,18 +648,24 @@ impl eframe::App for CodecApp {
             ui.separator();
             
             // Playback controls
-            ui.horizontal(|ui| {
-                if !self.is_playing {
-                    if ui.button("▶ Play Playlist (Gapless)").clicked() {
+            ui.horizontal(|ui| 
+            {
+                if !self.is_playing 
+                {
+                    if ui.button("▶ Play Playlist (Gapless)").clicked() 
+                    {
                         self.play_playlist_async();
                     }
-                } else {
-                    if ui.button("⏹ Stop").clicked() {
+                } else 
+                {
+                    if ui.button("⏹ Stop").clicked() 
+                    {
                         self.stop_playback();
                     }
                 }
                 
-                if ui.button("Export Playlist as Raw PCM").clicked() {
+                if ui.button("Export Playlist as Raw PCM").clicked() 
+                {
                     if let Some(path) = rfd::FileDialog::new()
                         .set_file_name("output.pcm")
                         .add_filter("Raw PCM", &["pcm", "raw"])
@@ -577,7 +677,8 @@ impl eframe::App for CodecApp {
             });
             
             // Export progress bar
-            if let Some(progress) = *self.export_progress.lock().unwrap() {
+            if let Some(progress) = *self.export_progress.lock().unwrap() 
+            {
                 ui.add(egui::ProgressBar::new(progress / 100.0)
                     .text(format!("Exporting: {:.0}%", progress)));
             }
@@ -585,14 +686,16 @@ impl eframe::App for CodecApp {
             ui.separator();
             
             // Status bars
-            ui.horizontal(|ui| {
+            ui.horizontal(|ui| 
+            {
                 ui.label("Status:");
                 ui.label(self.status.lock().unwrap().as_str());
             });
             
             // Detailed status
             let detailed = self.detailed_status.lock().unwrap().clone();
-            if !detailed.is_empty() {
+            if !detailed.is_empty() 
+            {
                 ui.horizontal(|ui| {
                     ui.label("Details:");
                     ui.label(detailed);
@@ -603,16 +706,20 @@ impl eframe::App for CodecApp {
 }
 
 // Custom audio source for rodio
-struct SamplesSource {
+struct SamplesSource 
+{
     samples: Vec<f32>,
     sample_rate: u32,
     channels: u16,
     position: usize,
 }
 
-impl SamplesSource {
-    fn new(samples: Vec<f32>, sample_rate: u32, channels: u16) -> Self {
-        Self {
+impl SamplesSource 
+{
+    fn new(samples: Vec<f32>, sample_rate: u32, channels: u16) -> Self 
+    {
+        Self 
+        {
             samples,
             sample_rate,
             channels,
@@ -621,34 +728,43 @@ impl SamplesSource {
     }
 }
 
-impl Iterator for SamplesSource {
+impl Iterator for SamplesSource 
+{
     type Item = f32;
     
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.position < self.samples.len() {
+    fn next(&mut self) -> Option<Self::Item> 
+    {
+        if self.position < self.samples.len() 
+        {
             let sample = self.samples[self.position];
             self.position += 1;
             Some(sample)
-        } else {
+        } else 
+        {
             None
         }
     }
 }
 
-impl Source for SamplesSource {
-    fn current_frame_len(&self) -> Option<usize> {
+impl Source for SamplesSource 
+{
+    fn current_frame_len(&self) -> Option<usize> 
+    {
         None
     }
     
-    fn channels(&self) -> u16 {
+    fn channels(&self) -> u16 
+    {
         self.channels
     }
     
-    fn sample_rate(&self) -> u32 {
+    fn sample_rate(&self) -> u32 
+    {
         self.sample_rate
     }
     
-    fn total_duration(&self) -> Option<Duration> {
+    fn total_duration(&self) -> Option<Duration> 
+    {
         Some(Duration::from_secs_f32(
             self.samples.len() as f32 / (self.sample_rate as f32 * self.channels as f32)
         ))
