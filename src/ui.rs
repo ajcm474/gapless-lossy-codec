@@ -10,7 +10,6 @@ use crossbeam_channel::{bounded, Sender, Receiver};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct CodecApp {
     selected_files: Vec<PathBuf>,
@@ -25,7 +24,6 @@ pub struct CodecApp {
     test_sink: Option<Sink>,
     _stream: Option<OutputStream>,
     stream_handle: Option<OutputStreamHandle>,
-    playback_stop_signal: Arc<AtomicBool>,
     
     // Progress tracking
     export_progress: Arc<Mutex<Option<f32>>>,
@@ -59,7 +57,6 @@ impl CodecApp {
             test_sink: None,
             _stream: Some(stream),
             stream_handle: Some(stream_handle),
-            playback_stop_signal: Arc::new(AtomicBool::new(false)),
             export_progress: Arc::new(Mutex::new(None)),
             encoding_progress: Arc::new(Mutex::new(None)),
             progress_receiver: None,
@@ -145,16 +142,13 @@ impl CodecApp {
             return;
         }
         
+        // Stop any existing playback first
         self.stop_playback();
-        
-        // Reset stop signal for new playback
-        self.playback_stop_signal.store(false, Ordering::Relaxed);
         
         let playlist = self.playlist.clone();
         let status = self.status.clone();
         let detailed_status = self.detailed_status.clone();
         let stream_handle = self.stream_handle.as_ref().unwrap().clone();
-        let stop_signal = self.playback_stop_signal.clone();
         
         let sink = match Sink::try_new(&stream_handle) {
             Ok(s) => Arc::new(Mutex::new(s)),
@@ -164,8 +158,11 @@ impl CodecApp {
             }
         };
         
-        self.audio_sink = Some(sink.clone());  // Store the sink
+        self.audio_sink = Some(sink.clone());
         self.is_playing = true;
+        
+        let is_playing = Arc::new(Mutex::new(true));  // Add playing flag
+        let is_playing_clone = is_playing.clone();
         
         thread::spawn(move || {
             let start_time = Instant::now();
@@ -175,10 +172,10 @@ impl CodecApp {
             let mut channels = 2;
             
             // Stream decode and play each track
-            'playlist_loop: for (idx, path) in playlist.iter().enumerate() {
-                // check if we should stop
-                if stop_signal.load(Ordering::Relaxed) {
-                    break 'playlist_loop;
+            for (idx, path) in playlist.iter().enumerate() {
+                // Check if we should stop
+                if !*is_playing_clone.lock().unwrap() {
+                    break;
                 }
                 
                 *status.lock().unwrap() = format!("Loading file {}/{}", idx + 1, playlist.len());
@@ -196,20 +193,17 @@ impl CodecApp {
                         let mut decoder = Decoder::new();
                         let arc_encoded = Arc::new(encoded);
                         
-                        // Start streaming decode
                         let (tx, rx) = bounded(10);
                         let chunk_receiver = decoder.decode_streaming(arc_encoded, Some(tx));
                         
                         let mut first_chunk = true;
                         
-                        // Process chunks as they arrive
                         while let Ok(chunk) = chunk_receiver.recv() {
                             // Check if we should stop
-                            if stop_signal.load(Ordering::Relaxed) {
-                                break 'playlist_loop;
+                            if !*is_playing_clone.lock().unwrap() {
+                                break;
                             }
                             
-                            // Update status from decoder
                             while let Ok(progress) = rx.try_recv() {
                                 match progress {
                                     Progress::Status(msg) => {
@@ -232,7 +226,6 @@ impl CodecApp {
                                 first_chunk = false;
                             }
                             
-                            // Create source from chunk and append to sink
                             let source = SamplesSource::new(chunk.samples, sample_rate, channels);
                             sink.lock().unwrap().append(source);
                             
@@ -253,6 +246,7 @@ impl CodecApp {
             
             sink.lock().unwrap().sleep_until_end();
             
+            *is_playing_clone.lock().unwrap() = false;
             *status.lock().unwrap() = "Playback finished".to_string();
         });
     }
@@ -403,11 +397,10 @@ impl CodecApp {
     }
     
     fn stop_playback(&mut self) {
-        // Signal the playback thread to stop
-        self.playback_stop_signal.store(true, Ordering::Relaxed);
-        
         if let Some(sink) = self.audio_sink.take() {
-            sink.lock().unwrap().stop();
+            let sink_guard = sink.lock().unwrap();
+            sink_guard.stop();
+            drop(sink_guard);  // Explicitly drop to ensure cleanup
         }
         self.is_playing = false;
         self.update_status("Stopped".to_string());
