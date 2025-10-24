@@ -212,7 +212,7 @@ impl CodecApp
                         
                         sample_rate = encoded.header.sample_rate;
                         channels = encoded.header.channels;
-                        let mut decoder = Decoder::new(channels as usize);
+                        let mut decoder = Decoder::new(channels as usize, sample_rate);
                         let arc_encoded = Arc::new(encoded);
                         
                         let (tx, rx) = bounded(10);
@@ -326,7 +326,7 @@ impl CodecApp
                             encoded.frames.len()
                         );
                         
-                        let mut decoder = Decoder::new(encoded.header.channels as usize);
+                        let mut decoder = Decoder::new(encoded.header.channels as usize, encoded.header.sample_rate);
                         let arc_encoded = Arc::new(encoded);
                         let (tx, rx) = bounded(10);
                         let chunk_receiver = decoder.decode_streaming(arc_encoded, Some(tx));

@@ -283,11 +283,12 @@ pub struct Decoder
     tables: Arc<MdctTables>,
     window: Arc<Vec<f32>>,
     overlap_buffers: Vec<Vec<f32>>, // per-channel overlap (len HOP_SIZE)
+    sample_rate: u32, // informational (for playback)
 }
 
 impl Decoder 
 {
-    pub fn new(channels: usize) -> Self 
+    pub fn new(channels: usize, sample_rate: u32) -> Self
     {
         let tables = Arc::new(MdctTables::new(HOP_SIZE));
         let window = tables.window.clone();
@@ -297,6 +298,7 @@ impl Decoder
             tables,
             window,
             overlap_buffers,
+            sample_rate,
         }
     }
 
