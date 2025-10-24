@@ -1,98 +1,10 @@
 use gapless_lossy_codec::codec::{Encoder, Decoder};
-use std::f32::consts::PI;
 
-/// Generate test waveforms
-fn generate_sine_wave(frequency: f32, sample_rate: u32, channels: u16, duration_seconds: f32) -> Vec<f32> 
-{
-    let total_samples = (sample_rate as f32 * duration_seconds) as usize;
-    let mut samples = Vec::with_capacity(total_samples * channels as usize);
-    
-    for i in 0..total_samples 
-    {
-        let t = i as f32 / sample_rate as f32;
-        let sample = (2.0 * PI * frequency * t).sin() * 0.5;
-        
-        for _ in 0..channels 
-        {
-            samples.push(sample);
-        }
-    }
-    
-    samples
-}
-
-fn generate_square_wave(frequency: f32, sample_rate: u32, channels: u16, duration_seconds: f32) -> Vec<f32> 
-{
-    let total_samples = (sample_rate as f32 * duration_seconds) as usize;
-    let mut samples = Vec::with_capacity(total_samples * channels as usize);
-    
-    for i in 0..total_samples 
-    {
-        let t = i as f32 / sample_rate as f32;
-        let phase = 2.0 * PI * frequency * t;
-        let sample = if phase.sin() >= 0.0 { 0.3 } else { -0.3 };
-        
-        for _ in 0..channels 
-        {
-            samples.push(sample);
-        }
-    }
-    
-    samples
-}
-
-fn generate_sawtooth_wave(frequency: f32, sample_rate: u32, channels: u16, duration_seconds: f32) -> Vec<f32> 
-{
-    let total_samples = (sample_rate as f32 * duration_seconds) as usize;
-    let mut samples = Vec::with_capacity(total_samples * channels as usize);
-    
-    for i in 0..total_samples 
-    {
-        let t = i as f32 / sample_rate as f32;
-        let phase = (2.0 * PI * frequency * t) % (2.0 * PI);
-        let sample = ((phase / PI) - 1.0) * 0.3;
-        
-        for _ in 0..channels 
-        {
-            samples.push(sample);
-        }
-    }
-    
-    samples
-}
-
-fn calculate_snr(original: &[f32], decoded: &[f32]) -> f32 
-{
-    let min_len = original.len().min(decoded.len());
-    if min_len < 2000 { return 0.0; }
-    
-    let start_idx = 1000;  // Skip initial transient
-    let end_idx = min_len - 1000;  // Skip final transient
-    
-    let mut signal_power = 0.0f32;
-    let mut noise_power = 0.0f32;
-    
-    for i in start_idx..end_idx 
-    {
-        let orig = original[i];
-        let dec = decoded.get(i).unwrap_or(&0.0);
-        let error = orig - dec;
-        
-        signal_power += orig * orig;
-        noise_power += error * error;
-    }
-    
-    if noise_power > 0.0 && signal_power > 0.0 
-    {
-        10.0 * (signal_power / noise_power).log10()
-    } else 
-    {
-        if noise_power == 0.0 { f32::INFINITY } else { 0.0 }
-    }
-}
+mod utils;
+use utils::{generate_sine_wave, generate_square_wave, generate_sawtooth_wave, calculate_snr};
 
 #[test]
-fn test_sine_wave_440hz_mono() 
+fn test_sine_wave_440hz_mono()
 {
     let samples = generate_sine_wave(440.0, 44100, 1, 2.0);
     let mut encoder = Encoder::new();
@@ -112,7 +24,7 @@ fn test_sine_wave_440hz_mono()
 }
 
 #[test]
-fn test_square_wave_1000hz_mono() 
+fn test_square_wave_1000hz_mono()
 {
     let samples = generate_square_wave(1000.0, 44100, 1, 2.0);
     let mut encoder = Encoder::new();
@@ -132,7 +44,7 @@ fn test_square_wave_1000hz_mono()
 }
 
 #[test]
-fn test_sawtooth_wave_440hz_mono() 
+fn test_sawtooth_wave_440hz_mono()
 {
     let samples = generate_sawtooth_wave(440.0, 44100, 1, 2.0);
     let mut encoder = Encoder::new();
@@ -152,7 +64,7 @@ fn test_sawtooth_wave_440hz_mono()
 }
 
 #[test]
-fn test_sample_rate_variations() 
+fn test_sample_rate_variations()
 {
     // Test 44.1 kHz
     let samples_44k = generate_sine_wave(440.0, 44100, 1, 1.0);
@@ -177,7 +89,7 @@ fn test_sample_rate_variations()
 }
 
 #[test]
-fn test_stereo_encoding() 
+fn test_stereo_encoding()
 {
     let samples = generate_sine_wave(440.0, 44100, 2, 2.0);
     let mut encoder = Encoder::new();
@@ -197,7 +109,7 @@ fn test_stereo_encoding()
 }
 
 #[test]
-fn test_short_duration() 
+fn test_short_duration()
 {
     let samples = generate_sine_wave(440.0, 44100, 1, 0.5);  // 0.5 seconds
     let mut encoder = Encoder::new();
@@ -211,7 +123,7 @@ fn test_short_duration()
 }
 
 #[test]
-fn test_long_duration() 
+fn test_long_duration()
 {
     let samples = generate_sine_wave(440.0, 44100, 1, 5.0);  // 5 seconds
     let mut encoder = Encoder::new();
@@ -225,7 +137,7 @@ fn test_long_duration()
 }
 
 #[test]
-fn test_gapless_multiple_files() 
+fn test_gapless_multiple_files()
 {
     // Simulate multiple files being decoded in sequence
     let file1 = generate_sine_wave(440.0, 44100, 1, 2.0);

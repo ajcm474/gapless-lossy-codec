@@ -1,46 +1,8 @@
 // Simple tests for basic codec functionality
 use gapless_lossy_codec::codec::{Encoder, Decoder};
-use std::f32::consts::PI;
 
-fn generate_sine_wave(frequency: f32, sample_rate: u32, duration: f32) -> Vec<f32>
-{
-    let total_samples = (sample_rate as f32 * duration) as usize;
-    let mut samples = Vec::with_capacity(total_samples);
-    
-    for i in 0..total_samples
-    {
-        let t = i as f32 / sample_rate as f32;
-        let sample = (2.0 * PI * frequency * t).sin() * 0.5;
-        samples.push(sample);
-    }
-    
-    samples
-}
-
-fn calculate_snr(original: &[f32], decoded: &[f32], start_idx: usize, end_idx: usize) -> f32
-{
-    let mut signal_power = 0.0f32;
-    let mut noise_power = 0.0f32;
-    
-    for i in start_idx..end_idx
-    {
-        let orig = original[i];
-        let dec = decoded[i];
-        let error = orig - dec;
-        
-        signal_power += orig * orig;
-        noise_power += error * error;
-    }
-    
-    if noise_power > 0.0 && signal_power > 0.0
-    {
-        10.0 * (signal_power / noise_power).log10()
-    }
-    else
-    {
-        if noise_power == 0.0 { f32::INFINITY } else { 0.0 }
-    }
-}
+mod utils;
+use utils::{generate_sine_wave, calculate_snr_range};
 
 #[test]
 fn test_basic_encode_decode()
@@ -50,7 +12,7 @@ fn test_basic_encode_decode()
     let duration = 2.0f32;
     let channels = 1u16;
     
-    let samples = generate_sine_wave(frequency, sample_rate, duration);
+    let samples = generate_sine_wave(frequency, sample_rate, channels, duration);
     
     println!("Generated {} samples of {}Hz sine wave at {}Hz sample rate", 
              samples.len(), frequency, sample_rate);
@@ -74,7 +36,7 @@ fn test_basic_encode_decode()
     let start_idx = 1000;
     let end_idx = min_len.min(samples.len() - 1000);
     
-    let snr = calculate_snr(&samples, &decoded, start_idx, end_idx);
+    let snr = calculate_snr_range(&samples, &decoded, start_idx, end_idx);
     println!("SNR: {:.2} dB", snr);
     
     assert!(snr > -10.0, "SNR too low: {} dB", snr);
@@ -88,7 +50,7 @@ fn test_length_preservation()
     let duration = 2.0f32;
     let channels = 1u16;
     
-    let samples = generate_sine_wave(frequency, sample_rate, duration);
+    let samples = generate_sine_wave(frequency, sample_rate, channels, duration);
     
     let mut encoder = Encoder::new();
     let encoded = encoder.encode(&samples, sample_rate, channels).expect("Encoding failed");
@@ -112,7 +74,7 @@ fn test_speed_ratio()
     let duration = 2.0f32;
     let channels = 1u16;
     
-    let samples = generate_sine_wave(frequency, sample_rate, duration);
+    let samples = generate_sine_wave(frequency, sample_rate, channels, duration);
     
     let mut encoder = Encoder::new();
     let encoded = encoder.encode(&samples, sample_rate, channels).expect("Encoding failed");
@@ -142,7 +104,7 @@ fn test_multiple_frequencies()
     
     for frequency in frequencies
     {
-        let samples = generate_sine_wave(frequency, sample_rate, 1.0);
+        let samples = generate_sine_wave(frequency, sample_rate, channels, 1.0);
         
         let mut encoder = Encoder::new();
         let encoded = encoder.encode(&samples, sample_rate, channels)
@@ -169,7 +131,7 @@ fn test_various_durations()
     
     for duration in durations
     {
-        let samples = generate_sine_wave(frequency, sample_rate, duration);
+        let samples = generate_sine_wave(frequency, sample_rate, channels, duration);
         
         let mut encoder = Encoder::new();
         let encoded = encoder.encode(&samples, sample_rate, channels)
