@@ -282,8 +282,8 @@ pub struct Decoder
 {
     tables: Arc<MdctTables>,
     window: Arc<Vec<f32>>,
-    overlap_buffers: Vec<Vec<f32>>, // per-channel overlap (len HOP_SIZE)
     sample_rate: u32, // informational (for playback)
+    channels: usize,
 }
 
 impl Decoder 
@@ -292,14 +292,29 @@ impl Decoder
     {
         let tables = Arc::new(MdctTables::new(HOP_SIZE));
         let window = tables.window.clone();
-        let overlap_buffers = vec![vec![0.0f32; HOP_SIZE]; channels];
         Self 
         {
             tables,
             window,
-            overlap_buffers,
             sample_rate,
+            channels,
         }
+    }
+
+    pub fn from_file(path: &str) -> Result<Self, std::io::Error> {
+        use std::fs;
+        let data = fs::read(path)?;
+        // Assume you know channels and sample rate from file header or default for now
+        // Replace 2/44100 with actual logic if available
+        Ok(Decoder::new(2, 44100))
+    }
+
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
     /// decode_streaming: decode frames in batch-parallel fashion, produce interleaved chunks

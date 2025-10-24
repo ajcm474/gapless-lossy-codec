@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, Sender, Receiver};
 use std::fs::File;
 use std::io::BufReader;
-use std::io::Write;
+use std::io::BufWriter;
+use flac_bound::{FlacEncoder, WriteWrapper};
+use hound;
 
 pub struct CodecApp 
 {
@@ -281,126 +283,114 @@ impl CodecApp
             *status.lock().unwrap() = "Playback finished".to_string();
         });
     }
-    
-    fn export_playlist_async(&mut self, output_path: PathBuf) 
+
+    fn export_playlist_async(&mut self, output_path: PathBuf)
     {
         let playlist = self.playlist.clone();
         let status = self.status.clone();
         let detailed_status = self.detailed_status.clone();
         let export_progress = self.export_progress.clone();
-        
-        thread::spawn(move || 
-        {
-            let start_time = Instant::now();
-            *export_progress.lock().unwrap() = Some(0.0);
-            *status.lock().unwrap() = "Starting export...".to_string();
-            
-            // Open output file
-            let mut output_file = match std::fs::File::create(&output_path) 
+
+        std::thread::spawn(move ||
             {
-                Ok(f) => f,
-                Err(e) => 
+                let start_time = Instant::now();
+                *export_progress.lock().unwrap() = Some(0.0);
+                *status.lock().unwrap() = "Starting export...".to_string();
+
+                // Collect all decoded samples first, then write to FLAC at once
+                let mut all_samples: Vec<f32> = Vec::new();
+                let mut sample_rate = 0u32;
+                let mut channels = 0u16;
+                let total_files = playlist.len();
+
+                for (file_idx, path) in playlist.iter().enumerate()
                 {
-                    *status.lock().unwrap() = format!("Failed to create output file: {}", e);
-                    *export_progress.lock().unwrap() = None;
-                    return;
-                }
-            };
-            
-            let total_files = playlist.len();
-            let mut total_samples_written = 0;
-            
-            for (file_idx, path) in playlist.iter().enumerate() 
-            {
-                let base_progress = (file_idx as f32 / total_files as f32) * 100.0;
-                *export_progress.lock().unwrap() = Some(base_progress);
-                *status.lock().unwrap() = format!("Loading file {}/{}", file_idx + 1, total_files);
-                
-                match load_encoded(path) 
-                {
-                    Ok(encoded) => 
+                    let base_progress = (file_idx as f32 / total_files as f32) * 100.0;
+                    *export_progress.lock().unwrap() = Some(base_progress);
+                    *status.lock().unwrap() = format!("Loading file {}/{}", file_idx + 1, total_files);
+
+                    match crate::codec::load_encoded(path)
                     {
-                        *detailed_status.lock().unwrap() = format!(
-                            "Processing {:?}: {} frames",
-                            path.file_name().unwrap(),
-                            encoded.frames.len()
-                        );
-                        
-                        let mut decoder = Decoder::new(encoded.header.channels as usize, encoded.header.sample_rate);
-                        let arc_encoded = Arc::new(encoded);
-                        let (tx, rx) = bounded(10);
-                        let chunk_receiver = decoder.decode_streaming(arc_encoded, Some(tx));
-                        
-                        // Process and write chunks as they arrive
-                        while let Ok(chunk) = chunk_receiver.recv() 
-                        {
-                            // Update progress
-                            while let Ok(progress) = rx.try_recv() 
+                        Ok(encoded) =>
                             {
-                                match progress 
+                                *detailed_status.lock().unwrap() = format!(
+                                    "Processing {:?}: {} frames",
+                                    path.file_name().unwrap(),
+                                    encoded.frames.len()
+                                );
+
+                                // Get sample rate and channels from first file
+                                if file_idx == 0
                                 {
-                                    Progress::Decoding(p) => 
-                                    {
-                                        let overall = base_progress + (p / 100.0) * (100.0 / total_files as f32);
-                                        *export_progress.lock().unwrap() = Some(overall);
-                                    }
-                                    Progress::Status(msg) => 
-                                    {
-                                        *detailed_status.lock().unwrap() = msg;
-                                    }
-                                    _ => {}
+                                    sample_rate = encoded.header.sample_rate;
+                                    channels = encoded.header.channels;
+                                }
+
+                                // Create decoder for this file using its native channels & sample_rate
+                                let mut decoder = crate::codec::Decoder::new(
+                                    encoded.header.channels as usize,
+                                    encoded.header.sample_rate,
+                                );
+
+                                // Use synchronous decode convenience (it internally uses streaming)
+                                match decoder.decode(&encoded, None)
+                                {
+                                    Ok(samples) =>
+                                        {
+                                            all_samples.extend_from_slice(&samples);
+                                            *status.lock().unwrap() = format!(
+                                                "Decoded file {}/{} ({} samples)",
+                                                file_idx + 1,
+                                                total_files,
+                                                samples.len()
+                                            );
+                                        }
+                                    Err(e) =>
+                                        {
+                                            *status.lock().unwrap() = format!("Decoding error: {}", e);
+                                            *export_progress.lock().unwrap() = None;
+                                            return;
+                                        }
                                 }
                             }
-                            
-                            // Convert chunk to PCM and write
-                            let bytes: Vec<u8> = chunk.samples.iter()
-                                .flat_map(|&sample| {
-                                    let scaled = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                                    scaled.to_le_bytes()
-                                })
-                                .collect();
-                            
-                            if let Err(e) = output_file.write_all(&bytes) 
+                        Err(e) =>
                             {
-                                *status.lock().unwrap() = format!("Error writing to file: {}", e);
+                                *status.lock().unwrap() = format!("Error loading file: {}", e);
                                 *export_progress.lock().unwrap() = None;
                                 return;
                             }
-                            
-                            total_samples_written += chunk.samples.len();
-                            *status.lock().unwrap() = format!(
-                                "Exported {} samples from file {}/{}", 
-                                total_samples_written, 
-                                file_idx + 1, 
-                                total_files
-                            );
-                            
-                            if chunk.is_last 
-                            {
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => 
-                    {
-                        *status.lock().unwrap() = format!("Error loading file: {}", e);
-                        *export_progress.lock().unwrap() = None;
-                        return;
                     }
                 }
-            }
-            
-            let total_time = start_time.elapsed();
-            *status.lock().unwrap() = format!(
-                "Exported {} samples to {:?} in {:.2}s",
-                total_samples_written,
-                output_path.file_name().unwrap(),
-                total_time.as_secs_f32()
-            );
-            
-            *export_progress.lock().unwrap() = None;
-        });
+
+                // Now export all samples to FLAC
+                *status.lock().unwrap() = "Writing FLAC file...".to_string();
+                *export_progress.lock().unwrap() = Some(95.0);
+
+                match crate::audio::export_to_flac(&output_path, &all_samples, sample_rate, channels)
+                {
+                    Ok(()) =>
+                        {
+                            let elapsed = start_time.elapsed();
+                            *status.lock().unwrap() = format!(
+                                "Exported {} samples to {:?} in {:.2}s",
+                                all_samples.len(),
+                                output_path.file_name().unwrap(),
+                                elapsed.as_secs_f32()
+                            );
+                        }
+                    Err(e) =>
+                        {
+                            *status.lock().unwrap() = format!("Error exporting FLAC: {}", e);
+                            *export_progress.lock().unwrap() = None;
+                            return;
+                        }
+                }
+
+                *export_progress.lock().unwrap() = None;
+            });
     }
+
+
     
     fn test_audio_device(&mut self) 
     {
@@ -507,7 +497,8 @@ impl eframe::App for CodecApp
                     {
                         if !self.is_testing 
                         {
-                            if ui.button("▶ Test Audio Output").clicked() {
+                            if ui.button("▶ Test Audio Output").clicked()
+                            {
                                 self.test_audio_device();
                             }
                         } else 
@@ -620,7 +611,8 @@ impl eframe::App for CodecApp
                     let mut to_remove = None;
                     for (i, path) in self.playlist.iter().enumerate() 
                     {
-                        ui.horizontal(|ui| {
+                        ui.horizontal(|ui|
+                        {
                             ui.label(format!("{}. {:?}", i + 1, path.file_name().unwrap()));
                             if ui.button(format!("Remove##{}", i)).clicked() 
                             {
@@ -663,12 +655,12 @@ impl eframe::App for CodecApp
                         self.stop_playback();
                     }
                 }
-                
-                if ui.button("Export Playlist as Raw PCM").clicked() 
+
+                if ui.button("Export Playlist as FLAC").clicked()
                 {
                     if let Some(path) = rfd::FileDialog::new()
-                        .set_file_name("output.pcm")
-                        .add_filter("Raw PCM", &["pcm", "raw"])
+                        .set_file_name("output.flac")
+                        .add_filter("FLAC", &["flac"])
                         .save_file()
                     {
                         self.export_playlist_async(path);
