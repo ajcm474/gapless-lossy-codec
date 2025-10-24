@@ -190,3 +190,26 @@ fn test_square_1000hz_48k_stereo()
     println!("1000Hz square 48kHz stereo: SNR = {:.2} dB", snr);
 }
 
+#[test]
+fn test_amplitude_modulation_detection()
+{
+    let samples = generate_sine_wave(440.0, 44100, 1, 2.0);
+    let mut encoder = Encoder::new();
+    let encoded = encoder.encode(&samples, 44100, 1).unwrap();
+    let mut decoder = Decoder::new();
+    let decoded = decoder.decode(&encoded, None).unwrap();
+
+    // Check for amplitude modulation by measuring envelope variation
+    let window_size = 100;
+    let mut max_variation = 0.0f32;
+    for i in window_size..(decoded.len() - window_size)
+    {
+        let local_max = decoded[i.saturating_sub(window_size)..i+window_size]
+            .iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let expected = 0.5; // Our sine wave amplitude
+        let variation = (local_max - expected).abs() / expected;
+        max_variation = max_variation.max(variation);
+    }
+
+    assert!(max_variation < 0.1, "Excessive amplitude modulation detected: {}", max_variation);
+}
