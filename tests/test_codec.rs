@@ -10,7 +10,7 @@ fn test_sine_wave_440hz_mono()
     let mut encoder = Encoder::new();
     let encoded = encoder.encode(&samples, 44100, 1).expect("Encoding failed");
     
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::new(encoded.header.channels as usize);
     let decoded = decoder.decode(&encoded, None).expect("Decoding failed");
     
     // Check length preservation (should be exactly the same)
@@ -30,7 +30,7 @@ fn test_square_wave_1000hz_mono()
     let mut encoder = Encoder::new();
     let encoded = encoder.encode(&samples, 44100, 1).expect("Encoding failed");
     
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::new(encoded.header.channels as usize);
     let decoded = decoder.decode(&encoded, None).expect("Decoding failed");
     
     // Check length preservation
@@ -50,7 +50,7 @@ fn test_sawtooth_wave_440hz_mono()
     let mut encoder = Encoder::new();
     let encoded = encoder.encode(&samples, 44100, 1).expect("Encoding failed");
     
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::new(encoded.header.channels as usize);
     let decoded = decoder.decode(&encoded, None).expect("Decoding failed");
     
     // Check length preservation
@@ -71,7 +71,7 @@ fn test_sample_rate_variations()
     let mut encoder = Encoder::new();
     let encoded_44k = encoder.encode(&samples_44k, 44100, 1).expect("44.1kHz encoding failed");
     
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::new(encoded_44k.header.channels as usize);
     let decoded_44k = decoder.decode(&encoded_44k, None).expect("44.1kHz decoding failed");
     assert_eq!(decoded_44k.len(), samples_44k.len());
     
@@ -80,7 +80,7 @@ fn test_sample_rate_variations()
     let mut encoder = Encoder::new();
     let encoded_48k = encoder.encode(&samples_48k, 48000, 1).expect("48kHz encoding failed");
     
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::new(encoded_44k.header.channels as usize);
     let decoded_48k = decoder.decode(&encoded_48k, None).expect("48kHz decoding failed");
     assert_eq!(decoded_48k.len(), samples_48k.len());
     
@@ -95,7 +95,7 @@ fn test_stereo_encoding()
     let mut encoder = Encoder::new();
     let encoded = encoder.encode(&samples, 44100, 2).expect("Stereo encoding failed");
     
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::new(encoded.header.channels as usize);
     let decoded = decoder.decode(&encoded, None).expect("Stereo decoding failed");
     
     // Check length preservation
@@ -115,7 +115,7 @@ fn test_short_duration()
     let mut encoder = Encoder::new();
     let encoded = encoder.encode(&samples, 44100, 1).expect("Short duration encoding failed");
     
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::new(encoded.header.channels as usize);
     let decoded = decoder.decode(&encoded, None).expect("Short duration decoding failed");
     
     assert_eq!(decoded.len(), samples.len());
@@ -129,7 +129,7 @@ fn test_long_duration()
     let mut encoder = Encoder::new();
     let encoded = encoder.encode(&samples, 44100, 1).expect("Long duration encoding failed");
     
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::new(encoded.header.channels as usize);
     let decoded = decoder.decode(&encoded, None).expect("Long duration decoding failed");
     
     assert_eq!(decoded.len(), samples.len());
@@ -153,7 +153,7 @@ fn test_gapless_multiple_files()
     let encoded3 = encoder.encode(&file3, 44100, 1).expect("File 3 encoding failed");
     
     // Decode each file
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::new(44100usize);
     let decoded1 = decoder.decode(&encoded1, None).expect("File 1 decoding failed");
     let decoded2 = decoder.decode(&encoded2, None).expect("File 2 decoding failed");
     let decoded3 = decoder.decode(&encoded3, None).expect("File 3 decoding failed");

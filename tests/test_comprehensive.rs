@@ -11,7 +11,7 @@ fn run_single_test(samples: Vec<f32>, sample_rate: u32, channels: u16) -> (f32, 
     let encoded = encoder.encode(&samples, sample_rate, channels).expect("Encoding failed");
     
     // Decode
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::new(encoded.header.channels as usize);
     let decoded = decoder.decode(&encoded, None).expect("Decoding failed");
     
     // Calculate quality metrics
@@ -196,7 +196,7 @@ fn test_amplitude_modulation_detection()
     let samples = generate_sine_wave(440.0, 44100, 1, 2.0);
     let mut encoder = Encoder::new();
     let encoded = encoder.encode(&samples, 44100, 1).unwrap();
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::new(encoded.header.channels as usize);
     let decoded = decoder.decode(&encoded, None).unwrap();
 
     // Check for amplitude modulation by measuring envelope variation

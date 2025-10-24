@@ -24,7 +24,7 @@ fn test_basic_encode_decode()
     println!("Encoded successfully: {} frames", encoded.frames.len());
     
     // Decode
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::new(encoded.header.channels as usize);
     let decoded = decoder.decode(&encoded, None).expect("Decoding failed");
     
     println!("Decoded successfully: {} samples", decoded.len());
@@ -55,7 +55,7 @@ fn test_length_preservation()
     let mut encoder = Encoder::new();
     let encoded = encoder.encode(&samples, sample_rate, channels).expect("Encoding failed");
     
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::new(encoded.header.channels as usize);
     let decoded = decoder.decode(&encoded, None).expect("Decoding failed");
     
     // Check for length issues (speed problem indicator)
@@ -79,7 +79,7 @@ fn test_speed_ratio()
     let mut encoder = Encoder::new();
     let encoded = encoder.encode(&samples, sample_rate, channels).expect("Encoding failed");
     
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::new(encoded.header.channels as usize);
     let decoded = decoder.decode(&encoded, None).expect("Decoding failed");
     
     // Calculate expected vs actual duration
@@ -110,7 +110,7 @@ fn test_multiple_frequencies()
         let encoded = encoder.encode(&samples, sample_rate, channels)
             .expect(&format!("Encoding failed for {}Hz", frequency));
         
-        let mut decoder = Decoder::new();
+        let mut decoder = Decoder::new(encoded.header.channels as usize);
         let decoded = decoder.decode(&encoded, None)
             .expect(&format!("Decoding failed for {}Hz", frequency));
         
@@ -137,7 +137,7 @@ fn test_various_durations()
         let encoded = encoder.encode(&samples, sample_rate, channels)
             .expect(&format!("Encoding failed for {:.1}s", duration));
         
-        let mut decoder = Decoder::new();
+        let mut decoder = Decoder::new(encoded.header.channels as usize);
         let decoded = decoder.decode(&encoded, None)
             .expect(&format!("Decoding failed for {:.1}s", duration));
         
