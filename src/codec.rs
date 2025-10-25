@@ -13,13 +13,15 @@ use rayon::prelude::*;
 
 const FRAME_SIZE: usize = 2048;  // 2N (samples per MDCT block)
 const HOP_SIZE: usize = 1024;    // N (hop, 50% overlap)
-const QUANTIZATION_BITS: u32 = 15;
+const QUANTIZATION_BITS: u32 = 16;
 const FRAMES_PER_CHUNK: usize = 500;
 const DECODE_BATCH: usize = 32;  // how many frames to decode in parallel per batch
 
 // Lossy compression parameters
-const NOISE_FLOOR_DB: f32 = -72.0;  // Coefficients below this are zeroed (-72dB is about 12-bit precision)
+const NOISE_FLOOR_DB: f32 = -48.0;
 const QUALITY_FACTOR: f32 = 0.7;     // Lower = more aggressive compression (0.1-1.0)
+const MIN_QUANTIZATION_BITS: u32 = 8;  // Use fewer bits for less important coefficients
+const MAX_QUANTIZATION_BITS: u32 = 16;  // Full resolution for important coefficients
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EncodedAudio 
@@ -76,9 +78,105 @@ pub struct AudioChunk
 // Lossy compression helpers
 //
 
+/// Precomputed perceptual weights (shared across all frames)
+#[derive(Clone)]
+struct PerceptualWeights
+{
+    weights: Arc<Vec<f32>>,
+    critical_bands: Arc<Vec<usize>>,
+}
+
+impl PerceptualWeights
+{
+    fn new(n: usize) -> Self
+    {
+        let weights: Vec<f32> = (0..n).map(|k|
+        {
+            // Frequency in normalized units (0 to 0.5 = DC to Nyquist)
+            let norm_freq = k as f32 / (2.0 * n as f32);
+            let freq_hz = norm_freq * 44100.0; // Assume 44.1kHz for weighting
+
+            let weight = if freq_hz < 100.0
+            {
+                0.3 + (freq_hz / 100.0) * 0.4  // Ramp up from DC
+            }
+            else if freq_hz < 200.0
+            {
+                0.7 + ((freq_hz - 100.0) / 100.0) * 0.3
+            }
+            else if freq_hz < 5000.0
+            {
+                1.0  // Peak sensitivity
+            }
+            else if freq_hz < 10000.0
+            {
+                1.0 - ((freq_hz - 5000.0) / 5000.0) * 0.3
+            }
+            else
+            {
+                0.7 - ((freq_hz - 10000.0) / 12000.0).min(1.0) * 0.5
+            };
+
+            weight.max(0.2)
+        }).collect();
+
+        let critical_bands = Self::compute_critical_bands(n);
+
+        Self
+        {
+            weights: Arc::new(weights),
+            critical_bands: Arc::new(critical_bands),
+        }
+    }
+
+    /// Compute approximate critical band edges (simplified Bark scale)
+    fn compute_critical_bands(n: usize) -> Vec<usize>
+    {
+        let mut bands = vec![0];
+        let nyquist = 22050.0;
+
+        // Start with 100 Hz spacing at low frequencies, increase to ~1000 Hz at high frequencies
+        let mut freq = 0.0f32;
+
+        while freq < nyquist && bands.len() < 50  // Limit to reasonable number of bands
+        {
+            let bin = ((freq / nyquist) * n as f32) as usize;
+            if bin > *bands.last().unwrap() && bin < n
+            {
+                bands.push(bin);
+            }
+
+            // Logarithmic spacing: wider bands at higher frequencies
+            if freq < 500.0
+            {
+                freq += 50.0;   // 50 Hz bands below 500 Hz
+            }
+            else if freq < 2000.0
+            {
+                freq += 100.0;  // 100 Hz bands 500-2000 Hz
+            }
+            else if freq < 8000.0
+            {
+                freq += 250.0;  // 250 Hz bands 2000-8000 Hz
+            }
+            else
+            {
+                freq += 500.0;  // 500 Hz bands above 8000 Hz
+            }
+        }
+
+        bands.push(n);
+        bands
+    }
+}
+
 /// Apply psychoacoustic masking to determine which coefficients can be discarded
 /// Returns a threshold per coefficient based on perceptual importance
-fn compute_masking_thresholds(coeffs: &[f32], quality: f32) -> Vec<f32>
+fn compute_masking_thresholds(
+    coeffs: &[f32],
+    quality: f32,
+    perceptual: &PerceptualWeights,
+) -> Vec<f32>
 {
     let n = coeffs.len();
     let mut thresholds = vec![0.0f32; n];
@@ -86,47 +184,76 @@ fn compute_masking_thresholds(coeffs: &[f32], quality: f32) -> Vec<f32>
     // Find global maximum for reference
     let global_max = coeffs.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-10);
 
-    // Compute energy in frequency bands
-    let band_size = 16;
-    let num_bands = (n + band_size - 1) / band_size;
+    let perceptual_weights = perceptual.weights.as_ref();
+    let band_edges = perceptual.critical_bands.as_ref();
 
-    for band in 0..num_bands
+    // Process each critical band
+    for band_idx in 0..band_edges.len().saturating_sub(1)
     {
-        let start = band * band_size;
-        let end = (start + band_size).min(n);
+        let start = band_edges[band_idx];
+        let end = band_edges[band_idx + 1].min(n);
 
-        // Compute band energy
-        let mut energy = 0.0f32;
-        for i in start..end
-        {
-            energy += coeffs[i] * coeffs[i];
-        }
-        energy = (energy / (end - start) as f32).sqrt();
+        if start >= end { continue; }
 
-        // Apply frequency-dependent threshold
-        // Lower frequencies need more precision, higher frequencies can be compressed more
-        // Band 0 = lowest frequency, gets lowest threshold
-        let freq_factor = (band as f32 / num_bands as f32).powf(2.0); // Quadratic increase
-        let freq_scale = 0.5 + freq_factor * 3.0; // Range: 0.5x to 3.5x
+        // Compute band energy (RMS)
+        let energy = (coeffs[start..end].iter()
+                                        .map(|x| x * x)
+                                        .sum::<f32>() / (end - start) as f32)
+            .sqrt();
 
-        // Compute masking threshold relative to band energy
-        // Quality factor: higher = better quality, less compression
+        // Average perceptual weight for this band
+        let avg_weight = perceptual_weights[start..end].iter().sum::<f32>() / (end - start) as f32;
+
+        // Masking threshold based on quality and perceptual importance
         let compression_factor = (1.0 - quality).max(0.01);
-        let base_threshold = energy * 0.002 * compression_factor; // 0.2% of band energy
-        let threshold = base_threshold * freq_scale;
+        let perceptual_factor = 1.0 / avg_weight.max(0.1);
+        let base_threshold = energy * 0.01 * compression_factor * perceptual_factor;
 
         // Apply to all coefficients in band
         for i in start..end
         {
-            // Cap threshold so we don't zero out significant coefficients
-            thresholds[i] = threshold.min(global_max * 0.05); // Max 5% of peak
+            let individual_factor = 1.0 / perceptual_weights[i].max(0.1);
+            thresholds[i] = base_threshold * individual_factor;
+
+            // Don't threshold away the largest peaks too aggressively
+            if coeffs[i].abs() > global_max * 0.3
+            {
+                thresholds[i] = thresholds[i].min(global_max * 0.05);
+            }
         }
     }
 
     thresholds
 }
 
-/// Apply noise floor and return sparse representation (index, value) pairs
+/// Determine quantization bits based on coefficient importance (fast version)
+#[inline]
+fn compute_quantization_bits_fast(
+    abs_val: f32,
+    threshold: f32,
+    global_max: f32,
+) -> u32
+{
+    if abs_val <= threshold
+    {
+        return 0;
+    }
+
+    // More important coefficients (higher above threshold) get more bits
+    let importance = (abs_val / threshold).log2().max(0.0);
+    let relative_magnitude = abs_val / global_max;
+
+    // Combine importance and magnitude
+    let score = importance * 0.3 + relative_magnitude * 0.7;
+
+    // Map score to bit depth
+    let bits = MIN_QUANTIZATION_BITS +
+        ((score * (MAX_QUANTIZATION_BITS - MIN_QUANTIZATION_BITS) as f32) as u32);
+
+    bits.clamp(MIN_QUANTIZATION_BITS, MAX_QUANTIZATION_BITS)
+}
+
+/// Apply noise floor and return sparse representation with fixed quantization denominator
 fn compress_coefficients(
     coeffs: &[f32],
     scale: f32,
@@ -134,19 +261,30 @@ fn compress_coefficients(
     noise_floor_db: f32,
 ) -> Vec<(u16, i16)>
 {
-    let noise_floor_linear = 10.0f32.powf(noise_floor_db / 20.0) * scale;
-    let mut sparse = Vec::new();
+    let noise_floor_linear = 10.0_f32.powf(noise_floor_db / 20.0) * scale;
+    let global_max = coeffs.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-10);
+
+    // We use (1 << (QUANTIZATION_BITS-1)) to leave room for sign.
+    let max_q = (1u32 << (QUANTIZATION_BITS - 1)) as f32;
+
+    let mut sparse = Vec::with_capacity(coeffs.len() / 4);
 
     for (k, &coeff) in coeffs.iter().enumerate()
     {
         let abs_val = coeff.abs();
-        let threshold = thresholds[k] * scale; // Scale threshold to absolute values
+        let threshold = thresholds[k] * scale;
 
-        // Check if coefficient is above noise floor OR above masking threshold
-        if abs_val > noise_floor_linear || abs_val > threshold
+        // Keep coefficient if above noise floor AND above perceptual threshold
+        if abs_val > noise_floor_linear && abs_val > threshold
         {
+            let importance_bits = compute_quantization_bits_fast(abs_val, threshold, global_max);
+            if importance_bits == 0
+            {
+                continue;
+            }
+
             let normalized = coeff / scale;
-            let quantized = (normalized * (1 << QUANTIZATION_BITS) as f32).round();
+            let quantized = (normalized * max_q).round();
             let q = quantized.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
 
             if q != 0
@@ -243,6 +381,7 @@ pub struct Encoder
 {
     tables: Arc<MdctTables>,
     window: Arc<Vec<f32>>,
+    perceptual: Arc<PerceptualWeights>,
 }
 
 impl Encoder 
@@ -251,35 +390,37 @@ impl Encoder
     {
         let n = HOP_SIZE;
         let tables = Arc::new(MdctTables::new(n));
+        let perceptual = Arc::new(PerceptualWeights::new(n));
         Self 
         {
             window: tables.window.clone(),
             tables,
+            perceptual,
         }
     }
 
     /// samples: interleaved PCM
-    pub fn encode(&mut self, samples: &[f32], sample_rate: u32, channels: u16) -> Result<EncodedAudio> 
+    pub fn encode(&mut self, samples: &[f32], sample_rate: u32, channels: u16) -> Result<EncodedAudio>
     {
         let total_samples = samples.len() as u64;
         let ch = channels as usize;
 
         // deinterleave channels
         let mut per_chan: Vec<Vec<f32>> = vec![Vec::with_capacity(samples.len() / ch + 8); ch];
-        for (i, &s) in samples.iter().enumerate() 
+        for (i, &s) in samples.iter().enumerate()
         {
             per_chan[i % ch].push(s);
         }
 
         // pad per-channel (half-hop at start and end)
         let mut padded: Vec<Vec<f32>> = Vec::with_capacity(ch);
-        for c in 0..ch 
+        for c in 0..ch
         {
             let mut v = Vec::with_capacity(per_chan[c].len() + HOP_SIZE);
             v.extend(std::iter::repeat(0.0f32).take(HOP_SIZE / 2));
             v.extend_from_slice(&per_chan[c]);
             let rem = v.len() % HOP_SIZE;
-            if rem != 0 
+            if rem != 0
             {
                 v.extend(std::iter::repeat(0.0f32).take(HOP_SIZE - rem));
             }
@@ -288,16 +429,17 @@ impl Encoder
         }
 
         // number of frames
-        let num_frames = if padded[0].len() < FRAME_SIZE 
+        let num_frames = if padded[0].len() < FRAME_SIZE
         {
             1usize
-        } else 
+        } else
         {
             (padded[0].len() - FRAME_SIZE) / HOP_SIZE + 1
         };
 
         let tables = self.tables.clone();
         let window = self.window.clone();
+        let perceptual = self.perceptual.clone();  // Clone Arc for parallel access
 
         // For each frame index, compute per-channel coeffs in parallel across frames
         let frames: Vec<EncodedFrame> = (0..num_frames).into_par_iter().map(|fi|
@@ -325,8 +467,8 @@ impl Encoder
                     let max_val = coeffs.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-10);
                     scale_factors.push(max_val);
 
-                    // compute psychoacoustic masking thresholds
-                    let thresholds = compute_masking_thresholds(&coeffs, QUALITY_FACTOR);
+                    // compute psychoacoustic masking thresholds (now with precomputed weights)
+                    let thresholds = compute_masking_thresholds(&coeffs, QUALITY_FACTOR, &perceptual);
 
                     // compress coefficients to sparse representation
                     let sparse = compress_coefficients(&coeffs, max_val, &thresholds, NOISE_FLOOR_DB);
@@ -346,16 +488,16 @@ impl Encoder
         let padding = (padded_len - orig_len - (HOP_SIZE / 2)) as u32;
         let encoder_delay = (HOP_SIZE / 2) as u32;
 
-        Ok(EncodedAudio 
+        Ok(EncodedAudio
         {
-            header: AudioHeader 
+            header: AudioHeader
             {
                 sample_rate,
                 channels,
                 total_samples,
             },
             frames,
-            gapless_info: GaplessInfo 
+            gapless_info: GaplessInfo
             {
                 encoder_delay,
                 padding,
@@ -447,12 +589,15 @@ impl Decoder
                         let sparse_data = &frame.sparse_coeffs_per_channel[ch];
                         let scale = frame.scale_factors[ch].max(1e-12);
 
+                        // Use same denominator as encoder
+                        let max_q = (1u32 << (QUANTIZATION_BITS - 1)) as f32;
+
                         // Fill in non-zero coefficients
                         for &(index, quantized_val) in sparse_data
                         {
                             if (index as usize) < tables.n
                             {
-                                coeffs[index as usize] = (quantized_val as f32 / (1 << QUANTIZATION_BITS) as f32) * scale;
+                                coeffs[index as usize] = (quantized_val as f32 / max_q) * scale;
                             }
                         }
 
