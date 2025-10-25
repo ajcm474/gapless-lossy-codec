@@ -10,6 +10,8 @@ use crossbeam_channel::{bounded, Sender, Receiver};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::BufWriter;
+
+#[cfg(feature = "flac-export")]
 use flac_bound::{FlacEncoder, WriteWrapper};
 use hound;
 
@@ -362,31 +364,47 @@ impl CodecApp
                     }
                 }
 
-                // Now export all samples to FLAC
-                *status.lock().unwrap() = "Writing FLAC file...".to_string();
+                // Export all samples to FLAC or WAV based on feature
+                *status.lock().unwrap() = "Writing audio file...".to_string();
                 *export_progress.lock().unwrap() = Some(95.0);
 
-                match crate::audio::export_to_flac(&output_path, &all_samples, sample_rate, channels)
+                #[cfg(feature = "flac-export")]
+                let export_result = crate::audio::export_to_flac(&output_path, &all_samples, sample_rate, channels);
+
+                #[cfg(not(feature = "flac-export"))]
+                let export_result =
+                {
+                    // Change .flac extension to .wav if FLAC not available
+                    let wav_path = if output_path.extension().and_then(|e| e.to_str()) == Some("flac")
+                    {
+                        output_path.with_extension("wav")
+                    }
+                    else
+                    {
+                        output_path.clone()
+                    };
+                    crate::audio::export_to_wav(&wav_path, &all_samples, sample_rate, channels)
+                };
+
+                match export_result
                 {
                     Ok(()) =>
-                        {
-                            let elapsed = start_time.elapsed();
-                            *status.lock().unwrap() = format!(
-                                "Exported {} samples to {:?} in {:.2}s",
-                                all_samples.len(),
-                                output_path.file_name().unwrap(),
-                                elapsed.as_secs_f32()
-                            );
-                        }
+                    {
+                        let elapsed = start_time.elapsed();
+                        *status.lock().unwrap() = format!(
+                            "Exported {} samples to {:?} in {:.2}s",
+                            all_samples.len(),
+                            output_path.file_name().unwrap(),
+                            elapsed.as_secs_f32()
+                        );
+                    }
                     Err(e) =>
-                        {
-                            *status.lock().unwrap() = format!("Error exporting FLAC: {}", e);
-                            *export_progress.lock().unwrap() = None;
-                            return;
-                        }
+                    {
+                        *status.lock().unwrap() = format!("Error exporting audio: {}", e);
+                        *export_progress.lock().unwrap() = None;
+                        return;
+                    }
                 }
-
-                *export_progress.lock().unwrap() = None;
             });
     }
 
@@ -656,11 +674,21 @@ impl eframe::App for CodecApp
                     }
                 }
 
-                if ui.button("Export Playlist as FLAC").clicked()
+                #[cfg(feature = "flac-export")]
+                let button_text = "Export Playlist as FLAC";
+                #[cfg(feature = "flac-export")]
+                let default_filename = "output.flac";
+
+                #[cfg(not(feature = "flac-export"))]
+                let button_text = "Export Playlist as WAV";
+                #[cfg(not(feature = "flac-export"))]
+                let default_filename = "output.wav";
+
+                if ui.button(button_text).clicked()
                 {
                     if let Some(path) = rfd::FileDialog::new()
-                        .set_file_name("output.flac")
-                        .add_filter("FLAC", &["flac"])
+                        .set_file_name(default_filename)
+                        .add_filter("Audio files", &["flac", "wav"])
                         .save_file()
                     {
                         self.export_playlist_async(path);

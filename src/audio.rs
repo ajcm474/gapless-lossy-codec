@@ -2,7 +2,17 @@ use anyhow::{anyhow, Result};
 use std::path::Path;
 use hound;
 use claxon;
+
+#[cfg(feature = "flac-export")]
 use flac_bound::{FlacEncoder, WriteWrapper};
+
+// Helper function to convert f32 samples to i16
+fn convert_f32_to_i16(samples: &[f32]) -> Vec<i16>
+{
+    samples.iter()
+           .map(|&sample| (sample * 32767.0).clamp(-32768.0, 32767.0) as i16)
+           .collect()
+}
 
 pub fn load_audio_file(path: &Path) -> Result<(Vec<f32>, u32, u16)> 
 {
@@ -61,6 +71,7 @@ fn load_flac(path: &Path) -> Result<(Vec<f32>, u32, u16)>
     Ok((samples, info.sample_rate, info.channels as u16))
 }
 
+#[cfg(feature = "flac-export")]
 pub fn export_to_flac(
     path: &Path,
     samples: &[f32],
@@ -103,5 +114,32 @@ pub fn export_to_flac(
     encoder.finish()
            .map_err(|e| anyhow!("Failed to finish FLAC encoding: {:?}", e))?;
 
+    Ok(())
+}
+
+pub fn export_to_wav(
+    path: &Path,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+) -> Result<()>
+{
+    let spec = hound::WavSpec
+    {
+        channels,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+
+    let mut writer = hound::WavWriter::create(path, spec)?;
+
+    let i16_samples = convert_f32_to_i16(samples);
+    for sample in i16_samples
+    {
+        writer.write_sample(sample)?;
+    }
+
+    writer.finalize()?;
     Ok(())
 }

@@ -213,3 +213,36 @@ fn test_amplitude_modulation_detection()
 
     assert!(max_variation < 0.1, "Excessive amplitude modulation detected: {}", max_variation);
 }
+
+#[test]
+fn test_amplitude_consistency()
+{
+    let samples = generate_sine_wave(440.0, 44100, 1, 2.0);
+    let mut encoder = Encoder::new();
+    let encoded = encoder.encode(&samples, 44100, 1).unwrap();
+    let mut decoder = Decoder::new(1, 44100);
+    let decoded = decoder.decode(&encoded, None).unwrap();
+
+    // Check amplitude
+    let window_size = 100;
+    let mut max_variation = 0.0f32;
+    let mut variations = Vec::new();
+
+    for i in window_size..(decoded.len() - window_size)
+    {
+        let local_max = decoded[i.saturating_sub(window_size)..i+window_size]
+            .iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let expected = 0.5;
+        let variation = (local_max - expected).abs() / expected;
+        max_variation = max_variation.max(variation);
+        if i % 10000 == 0
+        {
+            variations.push(variation);
+        }
+    }
+
+    println!("Max amplitude variation: {:.4} ({:.2}%)", max_variation, max_variation * 100.0);
+    println!("Sample variations: {:?}", variations);
+
+    assert!(max_variation < 0.1, "Amplitude variation too high: {:.4}", max_variation);
+}

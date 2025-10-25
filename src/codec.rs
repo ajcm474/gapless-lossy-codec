@@ -13,9 +13,13 @@ use rayon::prelude::*;
 
 const FRAME_SIZE: usize = 2048;  // 2N (samples per MDCT block)
 const HOP_SIZE: usize = 1024;    // N (hop, 50% overlap)
-const QUANTIZATION_BITS: u32 = 12;
+const QUANTIZATION_BITS: u32 = 15;
 const FRAMES_PER_CHUNK: usize = 500;
 const DECODE_BATCH: usize = 32;  // how many frames to decode in parallel per batch
+
+// Lossy compression parameters
+const NOISE_FLOOR_DB: f32 = -72.0;  // Coefficients below this are zeroed (-72dB is about 12-bit precision)
+const QUALITY_FACTOR: f32 = 0.7;     // Lower = more aggressive compression (0.1-1.0)
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EncodedAudio 
@@ -43,10 +47,11 @@ pub struct GaplessInfo
 
 /// Per-timeframe, per-channel data
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct EncodedFrame 
+pub struct EncodedFrame
 {
-    /// Outer vec: channel index -> inner vec: N i16 coefficients
-    pub mdct_coeffs_per_channel: Vec<Vec<i16>>,
+    /// Sparse representation: (index, value) pairs for non-zero coefficients
+    /// Outer vec: channel index -> inner vec: sparse coefficient data
+    pub sparse_coeffs_per_channel: Vec<Vec<(u16, i16)>>,
     /// scale factor per channel
     pub scale_factors: Vec<f32>,
 }
@@ -65,6 +70,93 @@ pub struct AudioChunk
 {
     pub samples: Vec<f32>, // interleaved
     pub is_last: bool,
+}
+
+//
+// Lossy compression helpers
+//
+
+/// Apply psychoacoustic masking to determine which coefficients can be discarded
+/// Returns a threshold per coefficient based on perceptual importance
+fn compute_masking_thresholds(coeffs: &[f32], quality: f32) -> Vec<f32>
+{
+    let n = coeffs.len();
+    let mut thresholds = vec![0.0f32; n];
+
+    // Find global maximum for reference
+    let global_max = coeffs.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-10);
+
+    // Compute energy in frequency bands
+    let band_size = 16;
+    let num_bands = (n + band_size - 1) / band_size;
+
+    for band in 0..num_bands
+    {
+        let start = band * band_size;
+        let end = (start + band_size).min(n);
+
+        // Compute band energy
+        let mut energy = 0.0f32;
+        for i in start..end
+        {
+            energy += coeffs[i] * coeffs[i];
+        }
+        energy = (energy / (end - start) as f32).sqrt();
+
+        // Apply frequency-dependent threshold
+        // Lower frequencies need more precision, higher frequencies can be compressed more
+        // Band 0 = lowest frequency, gets lowest threshold
+        let freq_factor = (band as f32 / num_bands as f32).powf(2.0); // Quadratic increase
+        let freq_scale = 0.5 + freq_factor * 3.0; // Range: 0.5x to 3.5x
+
+        // Compute masking threshold relative to band energy
+        // Quality factor: higher = better quality, less compression
+        let compression_factor = (1.0 - quality).max(0.01);
+        let base_threshold = energy * 0.002 * compression_factor; // 0.2% of band energy
+        let threshold = base_threshold * freq_scale;
+
+        // Apply to all coefficients in band
+        for i in start..end
+        {
+            // Cap threshold so we don't zero out significant coefficients
+            thresholds[i] = threshold.min(global_max * 0.05); // Max 5% of peak
+        }
+    }
+
+    thresholds
+}
+
+/// Apply noise floor and return sparse representation (index, value) pairs
+fn compress_coefficients(
+    coeffs: &[f32],
+    scale: f32,
+    thresholds: &[f32],
+    noise_floor_db: f32,
+) -> Vec<(u16, i16)>
+{
+    let noise_floor_linear = 10.0f32.powf(noise_floor_db / 20.0) * scale;
+    let mut sparse = Vec::new();
+
+    for (k, &coeff) in coeffs.iter().enumerate()
+    {
+        let abs_val = coeff.abs();
+        let threshold = thresholds[k] * scale; // Scale threshold to absolute values
+
+        // Check if coefficient is above noise floor OR above masking threshold
+        if abs_val > noise_floor_linear || abs_val > threshold
+        {
+            let normalized = coeff / scale;
+            let quantized = (normalized * (1 << QUANTIZATION_BITS) as f32).round();
+            let q = quantized.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+
+            if q != 0
+            {
+                sparse.push((k as u16, q));
+            }
+        }
+    }
+
+    sparse
 }
 
 //
@@ -208,47 +300,45 @@ impl Encoder
         let window = self.window.clone();
 
         // For each frame index, compute per-channel coeffs in parallel across frames
-        let frames: Vec<EncodedFrame> = (0..num_frames).into_par_iter().map(|fi| 
-        {
-            let mut mdct_coeffs_per_channel: Vec<Vec<i16>> = Vec::with_capacity(ch);
-            let mut scale_factors: Vec<f32> = Vec::with_capacity(ch);
-
-            for c in 0..ch 
+        let frames: Vec<EncodedFrame> = (0..num_frames).into_par_iter().map(|fi|
             {
-                let start = fi * HOP_SIZE;
-                let slice = &padded[c][start .. start + FRAME_SIZE];
+                let mut sparse_coeffs_per_channel: Vec<Vec<(u16, i16)>> = Vec::with_capacity(ch);
+                let mut scale_factors: Vec<f32> = Vec::with_capacity(ch);
 
-                // apply window to block
-                let mut block = vec![0.0f32; FRAME_SIZE];
-                for i in 0..FRAME_SIZE {
-                    block[i] = slice[i] * window[i];
-                }
-
-                // compute MDCT
-                let mut coeffs = vec![0.0f32; tables.n];
-                tables.mdct_block(&block, &mut coeffs);
-
-                // find per-channel scale
-                let max_val = coeffs.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-10);
-                scale_factors.push(max_val);
-
-                // quantize per-channel
-                let mut qvec = vec![0i16; tables.n];
-                for k in 0..tables.n 
+                for c in 0..ch
                 {
-                    let normalized = coeffs[k] / max_val;
-                    let quantized = (normalized * (1 << QUANTIZATION_BITS) as f32).round();
-                    qvec[k] = quantized.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-                }
-                mdct_coeffs_per_channel.push(qvec);
-            }
+                    let start = fi * HOP_SIZE;
+                    let slice = &padded[c][start .. start + FRAME_SIZE];
 
-            EncodedFrame 
-            {
-                mdct_coeffs_per_channel,
-                scale_factors,
-            }
-        }).collect();
+                    // apply window to block
+                    let mut block = vec![0.0f32; FRAME_SIZE];
+                    for i in 0..FRAME_SIZE
+                    {
+                        block[i] = slice[i] * window[i];
+                    }
+
+                    // compute MDCT
+                    let mut coeffs = vec![0.0f32; tables.n];
+                    tables.mdct_block(&block, &mut coeffs);
+
+                    // find per-channel scale
+                    let max_val = coeffs.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-10);
+                    scale_factors.push(max_val);
+
+                    // compute psychoacoustic masking thresholds
+                    let thresholds = compute_masking_thresholds(&coeffs, QUALITY_FACTOR);
+
+                    // compress coefficients to sparse representation
+                    let sparse = compress_coefficients(&coeffs, max_val, &thresholds, NOISE_FLOOR_DB);
+                    sparse_coeffs_per_channel.push(sparse);
+                }
+
+                EncodedFrame
+                {
+                    sparse_coeffs_per_channel,
+                    scale_factors,
+                }
+            }).collect();
 
         // compute padding metadata for gapless
         let padded_len = padded[0].len();
@@ -344,22 +434,26 @@ impl Decoder
                 let batch_end = (idx + DECODE_BATCH).min(total_frames);
 
                 // decode frames in parallel across the batch
-                let batch_results: Vec<(usize, Vec<Vec<f32>>)> = (idx..batch_end).into_par_iter().map(|fi| 
+                let batch_results: Vec<(usize, Vec<Vec<f32>>)> = (idx..batch_end).into_par_iter().map(|fi|
                 {
                     let frame = &encoded.frames[fi];
                     // per-channel out blocks
                     let mut per_channel_blocks: Vec<Vec<f32>> = Vec::with_capacity(channels);
 
-                    for ch in 0..channels 
+                    for ch in 0..channels
                     {
-                        // dequantize using per-channel scale
+                        // reconstruct coefficients from sparse representation
                         let mut coeffs = vec![0.0f32; tables.n];
-                        let qvec = &frame.mdct_coeffs_per_channel[ch];
+                        let sparse_data = &frame.sparse_coeffs_per_channel[ch];
                         let scale = frame.scale_factors[ch].max(1e-12);
 
-                        for k in 0..tables.n 
+                        // Fill in non-zero coefficients
+                        for &(index, quantized_val) in sparse_data
                         {
-                            coeffs[k] = (qvec[k] as f32 / (1 << QUANTIZATION_BITS) as f32) * scale;
+                            if (index as usize) < tables.n
+                            {
+                                coeffs[index as usize] = (quantized_val as f32 / (1 << QUANTIZATION_BITS) as f32) * scale;
+                            }
                         }
 
                         // IMDCT to FRAME_SIZE
@@ -367,7 +461,7 @@ impl Decoder
                         tables.imdct_block(&coeffs, &mut out_block);
 
                         // apply window
-                        for i in 0..FRAME_SIZE 
+                        for i in 0..FRAME_SIZE
                         {
                             out_block[i] *= window[i];
                         }
