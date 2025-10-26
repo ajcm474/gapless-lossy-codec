@@ -9,8 +9,8 @@ fn test_compression_effectiveness()
     let samples = generate_sine_wave(440.0, 44100, 1, 2.0);
     println!("Original samples: {}", samples.len());
 
-    let mut encoder = Encoder::new();
-    let encoded = encoder.encode(&samples, 44100, 1).unwrap();
+    let mut encoder = Encoder::new(44100);
+    let encoded = encoder.encode(&samples, 1).unwrap();
 
     println!("Frames: {}", encoded.frames.len());
 

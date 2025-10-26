@@ -1,6 +1,6 @@
 [package]
 name = "gapless-lossy-codec"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 build = "build.rs"
 
@@ -28,5 +28,5 @@ flac-export = ["flac-bound"]
 ui = ["eframe", "egui", "rfd", "rodio"]
 
 [[bin]]
-name = "gapless-codec"
+name = "glc"
 path = "src/main.rs"

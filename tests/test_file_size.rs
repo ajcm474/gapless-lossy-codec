@@ -10,10 +10,10 @@ fn test_compression_file_size()
     let samples = generate_sine_wave(440.0, 44100, 2, 10.0); // 10 seconds stereo
     println!("Original samples: {} ({} bytes as f32)", samples.len(), samples.len() * 4);
 
-    let mut encoder = Encoder::new();
-    let encoded = encoder.encode(&samples, 44100, 2).unwrap();
+    let mut encoder = Encoder::new(44100);
+    let encoded = encoder.encode(&samples, 2).unwrap();
 
-    let output_path = PathBuf::from("/tmp/inputs/test_encoded.glc");
+    let output_path = PathBuf::from("/tmp/test_encoded.glc");
     save_encoded(&encoded, &output_path).unwrap();
 
     let file_size = std::fs::metadata(&output_path).unwrap().len();

@@ -21,7 +21,7 @@ fn benchmark_mdct_computation()
         .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin() * 0.5)
         .collect();
 
-    let mut encoder = Encoder::new();
+    let mut encoder = Encoder::new(44100);
 
     // Encode just enough to process a few frames
     let start = Instant::now();
@@ -29,7 +29,7 @@ fn benchmark_mdct_computation()
     for _ in 0..iterations
     {
         // This will process multiple frames but gives us an idea
-        let _encoded = encoder.encode(&samples, 44100, 1).unwrap();
+        let _encoded = encoder.encode(&samples, 1).unwrap();
     }
     let elapsed = start.elapsed();
 
@@ -52,10 +52,10 @@ fn benchmark_frame_processing_sequential()
 
     for (name, samples) in test_cases
     {
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::new(44100);
 
         let start = Instant::now();
-        let encoded = encoder.encode(&samples, 44100, 1).unwrap();
+        let encoded = encoder.encode(&samples, 1).unwrap();
         let elapsed = start.elapsed();
 
         let num_frames = encoded.frames.len();
@@ -90,10 +90,10 @@ fn benchmark_compression_overhead()
     for (num_freqs, desc) in frequencies
     {
         let samples = generate_multi_sine(2.0, num_freqs);
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::new(44100);
 
         let start = Instant::now();
-        let encoded = encoder.encode(&samples, 44100, 1).unwrap();
+        let encoded = encoder.encode(&samples, 1).unwrap();
         let elapsed = start.elapsed();
 
         let num_frames = encoded.frames.len();
@@ -124,10 +124,10 @@ fn benchmark_memory_allocation()
 
     for pass in 1..=5
     {
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::new(44100);
 
         let start = Instant::now();
-        let _encoded = encoder.encode(&samples, 44100, 1).unwrap();
+        let _encoded = encoder.encode(&samples, 1).unwrap();
         let elapsed = start.elapsed();
 
         println!("  Pass {}: {:.2}ms", pass, elapsed.as_secs_f64() * 1000.0);
@@ -218,8 +218,8 @@ fn analyze_coefficient_distribution()
 
     for (name, samples) in test_signals
     {
-        let mut encoder = Encoder::new();
-        let encoded = encoder.encode(&samples, 44100, 1).unwrap();
+        let mut encoder = Encoder::new(44100);
+        let encoded = encoder.encode(&samples, 1).unwrap();
 
         let mut coeff_counts: Vec<usize> = encoded.frames.iter()
                                                   .map(|f| f.sparse_coeffs_per_channel[0].len())

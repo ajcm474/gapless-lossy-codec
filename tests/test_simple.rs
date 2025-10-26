@@ -18,13 +18,13 @@ fn test_basic_encode_decode()
              samples.len(), frequency, sample_rate);
     
     // Encode
-    let mut encoder = Encoder::new();
-    let encoded = encoder.encode(&samples, sample_rate, channels).expect("Encoding failed");
+    let mut encoder = Encoder::new(sample_rate);
+    let encoded = encoder.encode(&samples, channels).expect("Encoding failed");
     
     println!("Encoded successfully: {} frames", encoded.frames.len());
     
     // Decode
-    let mut decoder = Decoder::new(encoded.header.channels as usize, encoded.header.sample_rate);
+    let mut decoder = Decoder::new(channels as usize, sample_rate);
     let decoded = decoder.decode(&encoded, None).expect("Decoding failed");
     
     println!("Decoded successfully: {} samples", decoded.len());
@@ -52,10 +52,10 @@ fn test_length_preservation()
     
     let samples = generate_sine_wave(frequency, sample_rate, channels, duration);
     
-    let mut encoder = Encoder::new();
-    let encoded = encoder.encode(&samples, sample_rate, channels).expect("Encoding failed");
+    let mut encoder = Encoder::new(sample_rate);
+    let encoded = encoder.encode(&samples, channels).expect("Encoding failed");
     
-    let mut decoder = Decoder::new(encoded.header.channels as usize, encoded.header.sample_rate);
+    let mut decoder = Decoder::new(channels as usize, sample_rate);
     let decoded = decoder.decode(&encoded, None).expect("Decoding failed");
     
     // Check for length issues (speed problem indicator)
@@ -76,10 +76,10 @@ fn test_speed_ratio()
     
     let samples = generate_sine_wave(frequency, sample_rate, channels, duration);
     
-    let mut encoder = Encoder::new();
-    let encoded = encoder.encode(&samples, sample_rate, channels).expect("Encoding failed");
+    let mut encoder = Encoder::new(sample_rate);
+    let encoded = encoder.encode(&samples, channels).expect("Encoding failed");
     
-    let mut decoder = Decoder::new(encoded.header.channels as usize, encoded.header.sample_rate);
+    let mut decoder = Decoder::new(channels as usize, sample_rate);
     let decoded = decoder.decode(&encoded, None).expect("Decoding failed");
     
     // Calculate expected vs actual duration
@@ -106,11 +106,11 @@ fn test_multiple_frequencies()
     {
         let samples = generate_sine_wave(frequency, sample_rate, channels, 1.0);
         
-        let mut encoder = Encoder::new();
-        let encoded = encoder.encode(&samples, sample_rate, channels)
+        let mut encoder = Encoder::new(sample_rate);
+        let encoded = encoder.encode(&samples, channels)
             .expect(&format!("Encoding failed for {}Hz", frequency));
         
-        let mut decoder = Decoder::new(encoded.header.channels as usize, encoded.header.sample_rate);
+        let mut decoder = Decoder::new(channels as usize, sample_rate);
         let decoded = decoder.decode(&encoded, None)
             .expect(&format!("Decoding failed for {}Hz", frequency));
         
@@ -133,11 +133,11 @@ fn test_various_durations()
     {
         let samples = generate_sine_wave(frequency, sample_rate, channels, duration);
         
-        let mut encoder = Encoder::new();
-        let encoded = encoder.encode(&samples, sample_rate, channels)
+        let mut encoder = Encoder::new(sample_rate);
+        let encoded = encoder.encode(&samples, channels)
             .expect(&format!("Encoding failed for {:.1}s", duration));
         
-        let mut decoder = Decoder::new(encoded.header.channels as usize, encoded.header.sample_rate);
+        let mut decoder = Decoder::new(channels as usize, sample_rate);
         let decoded = decoder.decode(&encoded, None)
             .expect(&format!("Decoding failed for {:.1}s", duration));
         

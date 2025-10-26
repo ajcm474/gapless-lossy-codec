@@ -4,7 +4,7 @@ Proof of concept lossy audio codec written in Rust that preserves gapless playba
 ## Development Status
 Please note that this is currently a somewhat buggy implementation. 
 It does achieve gapless playback and lossy compression, 
-but at the cost of mangling the amplitude in some samples. 
+but at the cost of mangling the amplitude as much as 25% in a few outlier samples. 
 Why this happens is still under investigation.
 
 ## Export Functionality

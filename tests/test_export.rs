@@ -1,6 +1,6 @@
 // Test audio export functionality (FLAC when available, WAV as fallback)
 use gapless_lossy_codec::codec::{Encoder, Decoder};
-use gapless_lossy_codec::audio::load_audio_file;
+use gapless_lossy_codec::audio::load_audio_file_lossless;
 use std::path::PathBuf;
 
 #[cfg(feature = "flac-export")]
@@ -16,12 +16,12 @@ use utils::generate_sine_wave;
 fn test_export_basic()
 {
     let samples = generate_sine_wave(440.0, 44100, 2, 2.0);
-    let sample_rate = 44100;
+    let sample_rate: u32 = 44100;
     let channels = 2;
 
     // Encode
-    let mut encoder = Encoder::new();
-    let encoded = encoder.encode(&samples, sample_rate, channels).expect("Encoding failed");
+    let mut encoder = Encoder::new(44100);
+    let encoded = encoder.encode(&samples, channels).expect("Encoding failed");
 
     // Decode
     let mut decoder = Decoder::new(channels as usize, sample_rate);
@@ -29,10 +29,10 @@ fn test_export_basic()
 
     // Export based on feature
     #[cfg(feature = "flac-export")]
-    let output_path = PathBuf::from("/tmp/inputs/test_export.flac");
+    let output_path = PathBuf::from("/tmp/test_export.flac");
 
     #[cfg(not(feature = "flac-export"))]
-    let output_path = PathBuf::from("/tmp/inputs/test_export.wav");
+    let output_path = PathBuf::from("/tmp/test_export.wav");
 
     #[cfg(feature = "flac-export")]
     {
@@ -49,7 +49,7 @@ fn test_export_basic()
     assert!(output_path.exists(), "Output file was not created");
 
     // Load it back
-    let (loaded_samples, loaded_rate, loaded_channels) = load_audio_file(&output_path)
+    let (loaded_samples, loaded_rate, loaded_channels) = load_audio_file_lossless(&output_path)
         .expect("Failed to load exported file");
 
     assert_eq!(loaded_rate, sample_rate, "Sample rate mismatch");
@@ -67,12 +67,12 @@ fn test_export_basic()
 fn test_export_mono()
 {
     let samples = generate_sine_wave(1000.0, 48000, 1, 1.5);
-    let sample_rate = 48000;
+    let sample_rate: u32 = 48000;
     let channels = 1;
 
     // Encode
-    let mut encoder = Encoder::new();
-    let encoded = encoder.encode(&samples, sample_rate, channels).expect("Encoding failed");
+    let mut encoder = Encoder::new(48000);
+    let encoded = encoder.encode(&samples, channels).expect("Encoding failed");
 
     // Decode
     let mut decoder = Decoder::new(channels as usize, sample_rate);
@@ -80,10 +80,10 @@ fn test_export_mono()
 
     // Export based on feature
     #[cfg(feature = "flac-export")]
-    let output_path = PathBuf::from("/tmp/inputs/test_export_mono.flac");
+    let output_path = PathBuf::from("/tmp/test_export_mono.flac");
 
     #[cfg(not(feature = "flac-export"))]
-    let output_path = PathBuf::from("/tmp/inputs/test_export_mono.wav");
+    let output_path = PathBuf::from("/tmp/test_export_mono.wav");
 
     #[cfg(feature = "flac-export")]
     export_to_flac(&output_path, &decoded, sample_rate, channels).expect("FLAC export failed");
@@ -93,7 +93,7 @@ fn test_export_mono()
 
     assert!(output_path.exists(), "Output file was not created");
 
-    let (loaded_samples, loaded_rate, loaded_channels) = load_audio_file(&output_path)
+    let (loaded_samples, loaded_rate, loaded_channels) = load_audio_file_lossless(&output_path)
         .expect("Failed to load exported file");
 
     assert_eq!(loaded_rate, sample_rate);
@@ -118,10 +118,10 @@ fn test_export_gapless_playlist()
     let channels = 2;
 
     // Encode each file
-    let mut encoder = Encoder::new();
-    let encoded1 = encoder.encode(&file1, sample_rate, channels).expect("File 1 encoding failed");
-    let encoded2 = encoder.encode(&file2, sample_rate, channels).expect("File 2 encoding failed");
-    let encoded3 = encoder.encode(&file3, sample_rate, channels).expect("File 3 encoding failed");
+    let mut encoder = Encoder::new(44100);
+    let encoded1 = encoder.encode(&file1, channels).expect("File 1 encoding failed");
+    let encoded2 = encoder.encode(&file2, channels).expect("File 2 encoding failed");
+    let encoded3 = encoder.encode(&file3, channels).expect("File 3 encoding failed");
 
     // Decode each file and concatenate
     let mut decoder = Decoder::new(channels as usize, sample_rate);
@@ -136,10 +136,10 @@ fn test_export_gapless_playlist()
 
     // Export concatenated samples based on feature
     #[cfg(feature = "flac-export")]
-    let output_path = PathBuf::from("/tmp/inputs/test_gapless_playlist.flac");
+    let output_path = PathBuf::from("/tmp/test_gapless_playlist.flac");
 
     #[cfg(not(feature = "flac-export"))]
-    let output_path = PathBuf::from("/tmp/inputs/test_gapless_playlist.wav");
+    let output_path = PathBuf::from("/tmp/test_gapless_playlist.wav");
 
     #[cfg(feature = "flac-export")]
     export_to_flac(&output_path, &all_samples, sample_rate, channels)
@@ -151,7 +151,7 @@ fn test_export_gapless_playlist()
 
     assert!(output_path.exists());
 
-    let (loaded_samples, loaded_rate, loaded_channels) = load_audio_file(&output_path)
+    let (loaded_samples, loaded_rate, loaded_channels) = load_audio_file_lossless(&output_path)
         .expect("Failed to load exported file");
 
     assert_eq!(loaded_rate, sample_rate);

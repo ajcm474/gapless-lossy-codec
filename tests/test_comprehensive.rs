@@ -7,11 +7,11 @@ use utils::{generate_sine_wave, generate_square_wave, generate_sawtooth_wave, ge
 fn run_single_test(samples: Vec<f32>, sample_rate: u32, channels: u16) -> (f32, usize)
 {
     // Encode
-    let mut encoder = Encoder::new();
-    let encoded = encoder.encode(&samples, sample_rate, channels).expect("Encoding failed");
+    let mut encoder = Encoder::new(sample_rate);
+    let encoded = encoder.encode(&samples, channels).expect("Encoding failed");
     
     // Decode
-    let mut decoder = Decoder::new(encoded.header.channels as usize, encoded.header.sample_rate);
+    let mut decoder = Decoder::new(channels as usize, sample_rate);
     let decoded = decoder.decode(&encoded, None).expect("Decoding failed");
     
     // Calculate quality metrics
@@ -194,8 +194,8 @@ fn test_square_1000hz_48k_stereo()
 fn test_amplitude_consistency()
 {
     let samples = generate_sine_wave(440.0, 44100, 1, 2.0);
-    let mut encoder = Encoder::new();
-    let encoded = encoder.encode(&samples, 44100, 1).unwrap();
+    let mut encoder = Encoder::new(44100);
+    let encoded = encoder.encode(&samples, 1).unwrap();
     let mut decoder = Decoder::new(1, 44100);
     let decoded = decoder.decode(&encoded, None).unwrap();
 

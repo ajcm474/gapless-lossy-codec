@@ -1,3 +1,4 @@
+//! Handles file I/O for mainstream lossless audio codecs (WAV and FLAC)
 use anyhow::{anyhow, Result};
 use std::path::Path;
 use hound;
@@ -6,7 +7,8 @@ use claxon;
 #[cfg(feature = "flac-export")]
 use flac_bound::{FlacEncoder, WriteWrapper};
 
-// Helper function to convert f32 samples to i16
+/// Helper function to convert f32 samples to i16
+/// For each f32 sample, multiply by i16 max, then clamp to valid i16 range
 fn convert_f32_to_i16(samples: &[f32]) -> Vec<i16>
 {
     samples.iter()
@@ -14,7 +16,10 @@ fn convert_f32_to_i16(samples: &[f32]) -> Vec<i16>
            .collect()
 }
 
-pub fn load_audio_file(path: &Path) -> Result<(Vec<f32>, u32, u16)> 
+/// Load audio file from `Path` (only supports WAV and FLAC)
+/// Calls [`load_wav`] or [`load_flac`] depending on filetype
+/// Returns the sample vector, sample rate, and number of channels
+pub fn load_audio_file_lossless(path: &Path) -> Result<(Vec<f32>, u32, u16)>
 {
     let ext = path
         .extension()
@@ -22,7 +27,7 @@ pub fn load_audio_file(path: &Path) -> Result<(Vec<f32>, u32, u16)>
         .ok_or_else(|| anyhow!("No file extension"))?
         .to_lowercase();
 
-    match ext.as_str() 
+    match ext.as_str()
     {
         "wav" => load_wav(path),
         "flac" => load_flac(path),
@@ -30,6 +35,8 @@ pub fn load_audio_file(path: &Path) -> Result<(Vec<f32>, u32, u16)>
     }
 }
 
+/// Load WAV file from `Path`
+/// Returns the sample vector, sample rate, and number of channels
 fn load_wav(path: &Path) -> Result<(Vec<f32>, u32, u16)> 
 {
     let mut reader = hound::WavReader::open(path)?;
@@ -39,10 +46,12 @@ fn load_wav(path: &Path) -> Result<(Vec<f32>, u32, u16)>
     {
         hound::SampleFormat::Float => 
         {
+            // Pass through f32 samples
             reader.samples::<f32>().collect::<Result<Vec<_>, _>>()?
         }
         hound::SampleFormat::Int => 
         {
+            // Divide by max sample value to convert i32 samples to f32
             let bits = spec.bits_per_sample;
             let max = (1 << (bits - 1)) as f32;
             reader
@@ -55,6 +64,8 @@ fn load_wav(path: &Path) -> Result<(Vec<f32>, u32, u16)>
     Ok((samples, spec.sample_rate, spec.channels))
 }
 
+/// Load FLAC file from `Path`
+/// Returns the sample vector, sample rate, and number of channels
 fn load_flac(path: &Path) -> Result<(Vec<f32>, u32, u16)> 
 {
     let mut reader = claxon::FlacReader::open(path)?;
@@ -64,6 +75,7 @@ fn load_flac(path: &Path) -> Result<(Vec<f32>, u32, u16)>
     let mut samples = Vec::new();
     for sample in reader.samples() 
     {
+        // Divide by max sample value to convert i32 samples to f32
         let s = sample?;
         samples.push(s as f32 / max_sample_value);
     }
@@ -71,6 +83,8 @@ fn load_flac(path: &Path) -> Result<(Vec<f32>, u32, u16)>
     Ok((samples, info.sample_rate, info.channels as u16))
 }
 
+/// Export `samples` to `Path` using FLAC encoding
+/// Uses 16-bit depth and a compression level of 5
 #[cfg(feature = "flac-export")]
 pub fn export_to_flac(
     path: &Path,
@@ -82,6 +96,7 @@ pub fn export_to_flac(
     let mut file = std::fs::File::create(path)?;
     let mut write_wrapper = WriteWrapper(&mut file);
 
+    // Add FLAC headers
     let mut encoder = FlacEncoder::new()
         .ok_or_else(|| anyhow!("Failed to create FLAC encoder"))?
         .channels(channels as u32)
@@ -91,11 +106,10 @@ pub fn export_to_flac(
         .init_write(&mut write_wrapper)
         .map_err(|e| anyhow!("Failed to initialize FLAC encoder: {:?}", e))?;
 
-    // Convert f32 samples (interleaved) to i32 samples
     // FLAC encoder expects samples in range appropriate for bits_per_sample
     let num_frames = samples.len() / channels as usize;
 
-    // Deinterleave and convert to i32
+    // Deinterleave and convert f32 samples to i32
     let mut channel_buffers: Vec<Vec<i32>> = vec![Vec::with_capacity(num_frames); channels as usize];
     for (i, &sample) in samples.iter().enumerate()
     {
@@ -117,6 +131,8 @@ pub fn export_to_flac(
     Ok(())
 }
 
+/// Export `samples` to `Path` using WAV encoding (basically PCM with headers)
+/// Uses 16-bit depth
 pub fn export_to_wav(
     path: &Path,
     samples: &[f32],
@@ -124,6 +140,7 @@ pub fn export_to_wav(
     channels: u16,
 ) -> Result<()>
 {
+    // Add WAV headers
     let spec = hound::WavSpec
     {
         channels,
@@ -134,6 +151,13 @@ pub fn export_to_wav(
 
     let mut writer = hound::WavWriter::create(path, spec)?;
 
+    // WAV files apparently expect integer-valued samples
+    // See [http://tiny.systems/software/soundProgrammer/WavFormatDocs.pdf],
+    // particularly this part:
+    //
+    //      8-bit samples are stored as unsigned bytes, ranging from 0 to 255.
+    //      16-bit samples are stored as 2's-complement signed integers,
+    //      ranging from -32768 to 32767.
     let i16_samples = convert_f32_to_i16(samples);
     for sample in i16_samples
     {

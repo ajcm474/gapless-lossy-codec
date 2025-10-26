@@ -1,8 +1,9 @@
-//! Fast MDCT codec (multi-channel corrected, amplitude & timing fixed).
+//! Lossy codec with MDCT, psychoacoustic masking, and gapless playback
 //! - Precomputed cosine table
 //! - Parallel encode and batch-parallel decode (rayon)
-//! - Proper multi-channel storage: per-frame, per-channel coeffs & scales
+//! - Proper multichannel storage: per-frame, per-channel coeffs & scales
 //! - Matching normalization on MDCT and IMDCT
+//! - Preserves gapless playback via Overlap-Add
 use anyhow::Result;
 use serde::{Serialize, Deserialize};
 use std::f32::consts::PI;
@@ -70,7 +71,7 @@ pub enum Progress
 
 pub struct AudioChunk 
 {
-    pub samples: Vec<f32>, // interleaved
+    pub samples: Vec<f32>, // interleaved if multichannel
     pub is_last: bool,
 }
 
@@ -84,19 +85,20 @@ struct PerceptualWeights
 {
     weights: Arc<Vec<f32>>,
     critical_bands: Arc<Vec<usize>>,
+    sample_rate: u32,
 }
 
 impl PerceptualWeights
 {
-    fn new(n: usize) -> Self
+    fn new(n: usize, sample_rate: u32) -> Self
     {
         let weights: Vec<f32> = (0..n).map(|k|
         {
             // Frequency in normalized units (0 to 0.5 = DC to Nyquist)
             let norm_freq = k as f32 / (2.0 * n as f32);
-            let freq_hz = norm_freq * 44100.0; // Assume 44.1kHz for weighting
+            let freq_hz = norm_freq * sample_rate as f32;
 
-            let weight = if freq_hz < 100.0
+            let weight: f32 = if freq_hz < 100.0
             {
                 0.3 + (freq_hz / 100.0) * 0.4  // Ramp up from DC
             }
@@ -117,23 +119,25 @@ impl PerceptualWeights
                 0.7 - ((freq_hz - 10000.0) / 12000.0).min(1.0) * 0.5
             };
 
+            // Don't assign any weights less than 0.2
             weight.max(0.2)
         }).collect();
 
-        let critical_bands = Self::compute_critical_bands(n);
+        let critical_bands = Self::compute_critical_bands(n, sample_rate);
 
         Self
         {
             weights: Arc::new(weights),
             critical_bands: Arc::new(critical_bands),
+            sample_rate,
         }
     }
 
     /// Compute approximate critical band edges (simplified Bark scale)
-    fn compute_critical_bands(n: usize) -> Vec<usize>
+    fn compute_critical_bands(n: usize, sample_rate: u32) -> Vec<usize>
     {
         let mut bands = vec![0];
-        let nyquist = 22050.0;
+        let nyquist = sample_rate as f32 / 2.0;
 
         // Start with 100 Hz spacing at low frequencies, increase to ~1000 Hz at high frequencies
         let mut freq = 0.0f32;
@@ -297,9 +301,8 @@ fn compress_coefficients(
     sparse
 }
 
-//
-// Precomputed tables and helpers
-//
+/// Pre-computed tables for Modified Discrete Cosine Transform (MDCT)
+/// See [https://en.wikipedia.org/wiki/Modified_discrete_cosine_transform]
 #[derive(Clone)]
 struct MdctTables 
 {
@@ -313,6 +316,7 @@ impl MdctTables
 {
     fn new(n: usize) -> Self 
     {
+        // Pre-compute angles for cosine term
         let block = FRAME_SIZE;
         let mut table = Vec::with_capacity(n * block);
         for k in 0..n 
@@ -324,10 +328,13 @@ impl MdctTables
             }
         }
 
+        // Use sine window function with FRAME_SIZE as the window length
+        // (this avoids discontinuities at the frame boundaries)
         let window = (0..block)
             .map(|i| (PI * (i as f32 + 0.5) / (block as f32)).sin())
             .collect();
 
+        // √(2/N) normalization factor for orthonormal scaling
         let norm = (2.0 / n as f32).sqrt();
 
         Self 
@@ -339,7 +346,7 @@ impl MdctTables
         }
     }
 
-    /// MDCT (block len FRAME_SIZE -> N coefficients)
+    /// Modified Discrete Cosine Transform: block len FRAME_SIZE -> N coeffs
     fn mdct_block(&self, block: &[f32], out: &mut [f32]) 
     {
         let n = self.n;
@@ -357,7 +364,7 @@ impl MdctTables
         }
     }
 
-    /// IMDCT: N coeffs -> FRAME_SIZE out
+    /// Inverse Modified Discrete Cosine Transform: N coeffs -> FRAME_SIZE out
     fn imdct_block(&self, coeffs: &[f32], out: &mut [f32]) 
     {
         let base = self.cos_table.as_ref();
@@ -382,37 +389,39 @@ pub struct Encoder
     tables: Arc<MdctTables>,
     window: Arc<Vec<f32>>,
     perceptual: Arc<PerceptualWeights>,
+    sample_rate: u32,
 }
 
 impl Encoder 
 {
-    pub fn new() -> Self 
+    pub fn new(sample_rate: u32) -> Self
     {
         let n = HOP_SIZE;
         let tables = Arc::new(MdctTables::new(n));
-        let perceptual = Arc::new(PerceptualWeights::new(n));
+        let perceptual = Arc::new(PerceptualWeights::new(n, sample_rate));
         Self 
         {
             window: tables.window.clone(),
             tables,
             perceptual,
+            sample_rate
         }
     }
 
-    /// samples: interleaved PCM
-    pub fn encode(&mut self, samples: &[f32], sample_rate: u32, channels: u16) -> Result<EncodedAudio>
+    /// Encode PCM `samples` (interleaved if multichannel) to our GLC format
+    pub fn encode(&mut self, samples: &[f32], channels: u16) -> Result<EncodedAudio>
     {
         let total_samples = samples.len() as u64;
         let ch = channels as usize;
 
-        // deinterleave channels
+        // Deinterleave channels
         let mut per_chan: Vec<Vec<f32>> = vec![Vec::with_capacity(samples.len() / ch + 8); ch];
         for (i, &s) in samples.iter().enumerate()
         {
             per_chan[i % ch].push(s);
         }
 
-        // pad per-channel (half-hop at start and end)
+        // Pad per-channel (half-hop at start and end)
         let mut padded: Vec<Vec<f32>> = Vec::with_capacity(ch);
         for c in 0..ch
         {
@@ -428,7 +437,6 @@ impl Encoder
             padded.push(v);
         }
 
-        // number of frames
         let num_frames = if padded[0].len() < FRAME_SIZE
         {
             1usize
@@ -443,46 +451,46 @@ impl Encoder
 
         // For each frame index, compute per-channel coeffs in parallel across frames
         let frames: Vec<EncodedFrame> = (0..num_frames).into_par_iter().map(|fi|
+        {
+            let mut sparse_coeffs_per_channel: Vec<Vec<(u16, i16)>> = Vec::with_capacity(ch);
+            let mut scale_factors: Vec<f32> = Vec::with_capacity(ch);
+
+            for c in 0..ch
             {
-                let mut sparse_coeffs_per_channel: Vec<Vec<(u16, i16)>> = Vec::with_capacity(ch);
-                let mut scale_factors: Vec<f32> = Vec::with_capacity(ch);
+                let start = fi * HOP_SIZE;
+                let slice = &padded[c][start .. start + FRAME_SIZE];
 
-                for c in 0..ch
+                // Apply window to block
+                let mut block = vec![0.0f32; FRAME_SIZE];
+                for i in 0..FRAME_SIZE
                 {
-                    let start = fi * HOP_SIZE;
-                    let slice = &padded[c][start .. start + FRAME_SIZE];
-
-                    // apply window to block
-                    let mut block = vec![0.0f32; FRAME_SIZE];
-                    for i in 0..FRAME_SIZE
-                    {
-                        block[i] = slice[i] * window[i];
-                    }
-
-                    // compute MDCT
-                    let mut coeffs = vec![0.0f32; tables.n];
-                    tables.mdct_block(&block, &mut coeffs);
-
-                    // find per-channel scale
-                    let max_val = coeffs.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-10);
-                    scale_factors.push(max_val);
-
-                    // compute psychoacoustic masking thresholds (now with precomputed weights)
-                    let thresholds = compute_masking_thresholds(&coeffs, QUALITY_FACTOR, &perceptual);
-
-                    // compress coefficients to sparse representation
-                    let sparse = compress_coefficients(&coeffs, max_val, &thresholds, NOISE_FLOOR_DB);
-                    sparse_coeffs_per_channel.push(sparse);
+                    block[i] = slice[i] * window[i];
                 }
 
-                EncodedFrame
-                {
-                    sparse_coeffs_per_channel,
-                    scale_factors,
-                }
-            }).collect();
+                // Compute MDCT
+                let mut coeffs = vec![0.0f32; tables.n];
+                tables.mdct_block(&block, &mut coeffs);
 
-        // compute padding metadata for gapless
+                // Find per-channel scale
+                let max_val = coeffs.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-10);
+                scale_factors.push(max_val);
+
+                // Compute psychoacoustic masking thresholds
+                let thresholds = compute_masking_thresholds(&coeffs, QUALITY_FACTOR, &perceptual);
+
+                // compress coefficients to sparse representation
+                let sparse = compress_coefficients(&coeffs, max_val, &thresholds, NOISE_FLOOR_DB);
+                sparse_coeffs_per_channel.push(sparse);
+            }
+
+            EncodedFrame
+            {
+                sparse_coeffs_per_channel,
+                scale_factors,
+            }
+        }).collect();
+
+        // Compute padding metadata for gapless reconstruction
         let padded_len = padded[0].len();
         let orig_len = per_chan[0].len();
         let padding = (padded_len - orig_len - (HOP_SIZE / 2)) as u32;
@@ -492,7 +500,7 @@ impl Encoder
         {
             header: AudioHeader
             {
-                sample_rate,
+                sample_rate: self.sample_rate,
                 channels,
                 total_samples,
             },
@@ -533,30 +541,15 @@ impl Decoder
         }
     }
 
-    pub fn from_file(path: &str) -> Result<Self, std::io::Error> {
-        use std::fs;
-        let data = fs::read(path)?;
-        // Assume you know channels and sample rate from file header or default for now
-        // Replace 2/44100 with actual logic if available
-        Ok(Decoder::new(2, 44100))
-    }
-
-    pub fn channels(&self) -> usize {
-        self.channels
-    }
-
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    /// decode_streaming: decode frames in batch-parallel fashion, produce interleaved chunks
+    /// Decode frames in batch-parallel fashion, producing interleaved chunks
     pub fn decode_streaming(&mut self, encoded: Arc<EncodedAudio>, progress_sender: Option<Sender<Progress>>) -> Receiver<AudioChunk> 
     {
         let (tx, rx) = bounded(5);
         let channels = encoded.header.channels as usize;
         let tables = self.tables.clone();
         let window = self.window.clone();
-        // local overlap buffers per-thread: start from current state
+
+        // Local overlap buffers per-thread: start from current state
         let mut overlap = vec![vec![0.0f32; HOP_SIZE]; channels];
 
         std::thread::spawn(move || 
@@ -575,16 +568,15 @@ impl Decoder
             {
                 let batch_end = (idx + DECODE_BATCH).min(total_frames);
 
-                // decode frames in parallel across the batch
+                // Decode frames in parallel across the batch
                 let batch_results: Vec<(usize, Vec<Vec<f32>>)> = (idx..batch_end).into_par_iter().map(|fi|
                 {
                     let frame = &encoded.frames[fi];
-                    // per-channel out blocks
                     let mut per_channel_blocks: Vec<Vec<f32>> = Vec::with_capacity(channels);
 
                     for ch in 0..channels
                     {
-                        // reconstruct coefficients from sparse representation
+                        // Reconstruct coefficients from sparse representation
                         let mut coeffs = vec![0.0f32; tables.n];
                         let sparse_data = &frame.sparse_coeffs_per_channel[ch];
                         let scale = frame.scale_factors[ch].max(1e-12);
@@ -605,7 +597,7 @@ impl Decoder
                         let mut out_block = vec![0.0f32; FRAME_SIZE];
                         tables.imdct_block(&coeffs, &mut out_block);
 
-                        // apply window
+                        // Apply window
                         for i in 0..FRAME_SIZE
                         {
                             out_block[i] *= window[i];
@@ -623,7 +615,8 @@ impl Decoder
 
                 for (_fi, per_channel_blocks) in batch_results.into_iter() 
                 {
-                    // For each frame, do per-channel overlap-add, produce HOP_SIZE samples per-channel, then interleave them
+                    // For each frame, do per-channel overlap-add,
+                    // produce HOP_SIZE samples per-channel, then interleave them
                     // accumulate interleaved HOP_SIZE * channels samples into chunk_samples
                     for i in 0..HOP_SIZE 
                     {

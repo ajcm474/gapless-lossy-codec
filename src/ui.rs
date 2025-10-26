@@ -1,5 +1,5 @@
 use crate::codec::{Encoder, Decoder, EncodedAudio, save_encoded, load_encoded, Progress};
-use crate::audio::load_audio_file;
+use crate::audio::load_audio_file_lossless;
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -100,7 +100,7 @@ impl CodecApp
             let result = (|| -> anyhow::Result<(PathBuf, EncodedAudio, f32)> 
             {
                 let load_start = Instant::now();
-                let (samples, sample_rate, channels) = load_audio_file(&input_path)?;
+                let (samples, sample_rate, channels) = load_audio_file_lossless(&input_path)?;
                 *detailed_status.lock().unwrap() = format!(
                     "Loaded {} samples in {:.2}s", 
                     samples.len(), 
@@ -111,8 +111,8 @@ impl CodecApp
                 *status.lock().unwrap() = format!("Encoding: {:?}", input_path.file_name().unwrap());
                 
                 let encode_start = Instant::now();
-                let mut encoder = Encoder::new();
-                let encoded = encoder.encode(&samples, sample_rate, channels)?;
+                let mut encoder = Encoder::new(sample_rate);
+                let encoded = encoder.encode(&samples, channels)?;
                 *detailed_status.lock().unwrap() = format!(
                     "Encoded {} frames in {:.2}s", 
                     encoded.frames.len(), 

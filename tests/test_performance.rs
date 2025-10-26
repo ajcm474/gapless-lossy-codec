@@ -10,7 +10,7 @@ fn test_benchmark_perceptual_weights_creation()
     let start = Instant::now();
     for _ in 0..1000
     {
-        let _encoder = Encoder::new();
+        let _encoder = Encoder::new(44100);
     }
     let elapsed = start.elapsed();
     println!("Creating 1000 encoders (with perceptual weights): {:.2}ms",
@@ -23,10 +23,10 @@ fn benchmark_single_frame_encoding()
 {
     let samples = generate_sine_wave(440.0, 44100, 1, 0.1); // Just 0.1 seconds
 
-    let mut encoder = Encoder::new();
+    let mut encoder = Encoder::new(44100);
 
     let start = Instant::now();
-    let _encoded = encoder.encode(&samples, 44100, 1).unwrap();
+    let _encoded = encoder.encode(&samples, 1).unwrap();
     let elapsed = start.elapsed();
 
     println!("Encoding 0.1s of audio: {:.2}ms", elapsed.as_secs_f64() * 1000.0);
@@ -40,10 +40,10 @@ fn benchmark_encoding_by_duration()
     for duration in durations
     {
         let samples = generate_sine_wave(440.0, 44100, 1, duration);
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::new(44100);
 
         let start = Instant::now();
-        let _encoded = encoder.encode(&samples, 44100, 1).unwrap();
+        let _encoded = encoder.encode(&samples, 1).unwrap();
         let elapsed = start.elapsed();
 
         let frames_per_sec = (samples.len() as f64 / 44100.0) / elapsed.as_secs_f64();
@@ -64,23 +64,23 @@ fn benchmark_complex_waveform_encoding()
 
     // Sine wave (simple, sparse spectrum)
     let samples = generate_sine_wave(440.0, 44100, 1, duration);
-    let mut encoder = Encoder::new();
+    let mut encoder = Encoder::new(44100);
     let start = Instant::now();
-    let encoded_sine = encoder.encode(&samples, 44100, 1).unwrap();
+    let encoded_sine = encoder.encode(&samples, 1).unwrap();
     let sine_time = start.elapsed();
 
     // Square wave (complex, many harmonics)
     let samples = utils::generate_square_wave(440.0, 44100, 1, duration);
-    let mut encoder = Encoder::new();
+    let mut encoder = Encoder::new(44100);
     let start = Instant::now();
-    let encoded_square = encoder.encode(&samples, 44100, 1).unwrap();
+    let encoded_square = encoder.encode(&samples, 1).unwrap();
     let square_time = start.elapsed();
 
     // Sawtooth wave (very complex, most harmonics)
     let samples = utils::generate_sawtooth_wave(440.0, 44100, 1, duration);
-    let mut encoder = Encoder::new();
+    let mut encoder = Encoder::new(44100);
     let start = Instant::now();
-    let encoded_saw = encoder.encode(&samples, 44100, 1).unwrap();
+    let encoded_saw = encoder.encode(&samples, 1).unwrap();
     let saw_time = start.elapsed();
 
     println!("  Sine wave:     {:.2}ms ({} frames, {} total coeffs)",
@@ -112,16 +112,16 @@ fn benchmark_stereo_vs_mono()
 
     // Mono
     let samples_mono = generate_sine_wave(440.0, 44100, 1, duration);
-    let mut encoder = Encoder::new();
+    let mut encoder = Encoder::new(44100);
     let start = Instant::now();
-    let _encoded_mono = encoder.encode(&samples_mono, 44100, 1).unwrap();
+    let _encoded_mono = encoder.encode(&samples_mono, 1).unwrap();
     let mono_time = start.elapsed();
 
     // Stereo
     let samples_stereo = generate_sine_wave(440.0, 44100, 2, duration);
-    let mut encoder = Encoder::new();
+    let mut encoder = Encoder::new(44100);
     let start = Instant::now();
-    let _encoded_stereo = encoder.encode(&samples_stereo, 44100, 2).unwrap();
+    let _encoded_stereo = encoder.encode(&samples_stereo, 2).unwrap();
     let stereo_time = start.elapsed();
 
     println!("Mono:   {:.2}ms", mono_time.as_secs_f64() * 1000.0);
@@ -145,9 +145,9 @@ fn benchmark_parallel_scaling()
             .unwrap();
 
         let time = pool.install(|| {
-            let mut encoder = Encoder::new();
+            let mut encoder = Encoder::new(44100);
             let start = Instant::now();
-            let _encoded = encoder.encode(&samples, 44100, 1).unwrap();
+            let _encoded = encoder.encode(&samples, 1).unwrap();
             start.elapsed()
         });
 
@@ -162,14 +162,14 @@ fn profile_encoding_stages()
 
     println!("\nProfiling encoding stages for 2.0s audio:");
 
-    let mut encoder = Encoder::new();
+    let mut encoder = Encoder::new(44100);
 
     // We'll do this manually to time each stage
     // Note: This is a rough approximation since we can't easily insert timing
     // into the parallel iterator without modifying the source
 
     let total_start = Instant::now();
-    let encoded = encoder.encode(&samples, 44100, 1).unwrap();
+    let encoded = encoder.encode(&samples, 1).unwrap();
     let total_time = total_start.elapsed();
 
     println!("  Total encoding: {:.2}ms", total_time.as_secs_f64() * 1000.0);
@@ -192,8 +192,8 @@ fn benchmark_decode_speed()
 {
     let samples = generate_sine_wave(440.0, 44100, 1, 5.0);
 
-    let mut encoder = Encoder::new();
-    let encoded = encoder.encode(&samples, 44100, 1).unwrap();
+    let mut encoder = Encoder::new(44100);
+    let encoded = encoder.encode(&samples, 1).unwrap();
 
     let mut decoder = Decoder::new(1, 44100);
 
@@ -213,8 +213,8 @@ fn benchmark_full_roundtrip()
     let samples = generate_sine_wave(440.0, 44100, 1, duration as f32);
 
     let encode_start = Instant::now();
-    let mut encoder = Encoder::new();
-    let encoded = encoder.encode(&samples, 44100, 1).unwrap();
+    let mut encoder = Encoder::new(44100);
+    let encoded = encoder.encode(&samples, 1).unwrap();
     let encode_time = encode_start.elapsed();
 
     let decode_start = Instant::now();
