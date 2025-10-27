@@ -1,3 +1,7 @@
+## Version 0.4.1
+- Allow encoding files using the `glc` binary without needing to have the `ui` feature enabled
+- Don't try to link `libFLAC` if the `flac-export` feature is not enabled
+
 ## Version 0.4.0
 - Breaking change: `Encoder::new` now requires that a sample rate be specified
   - This ensures that the pre-computed weights use the correct nyquist value

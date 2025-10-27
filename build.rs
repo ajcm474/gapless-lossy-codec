@@ -1,22 +1,22 @@
 fn main() {
-    #[cfg(target_os = "linux")]
+    // Only link to libFLAC if the flac-export feature is enabled
+    #[cfg(all(feature = "flac-export", target_os = "linux"))]
     {
         // Use the correct case for Arch Linux
         println!("cargo:rustc-link-lib=FLAC");
+        println!("cargo:rustc-link-search=native=/usr/lib");
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(feature = "flac-export", target_os = "macos"))]
     {
         println!("cargo:rustc-link-lib=FLAC");
+        println!("cargo:rustc-link-search=native=/usr/local/lib");
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(all(feature = "flac-export", target_os = "windows"))]
     {
         println!("cargo:rustc-link-lib=flac");
     }
-
-    // Optional: tell Cargo where to find /usr/lib if needed
-    println!("cargo:rustc-link-search=native=/usr/lib");
 }
 
 // fn main()
