@@ -24,13 +24,16 @@ const QUALITY_FACTOR: f32 = 0.7;     // Lower = more aggressive compression (0.1
 const MIN_QUANTIZATION_BITS: u32 = 8;  // Use fewer bits for less important coefficients
 const MAX_QUANTIZATION_BITS: u32 = 16;  // Full resolution for important coefficients
 
+// Per-frame compression threshold
+// If compressed frame would be >= this fraction of raw PCM size, use raw PCM
+const COMPRESSION_THRESHOLD: f32 = 0.85;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EncodedAudio
 {
     pub header: AudioHeader,
     pub frames: Vec<EncodedFrame>, // time-ordered frames (empty if raw_pcm is used)
     pub gapless_info: GaplessInfo,
-    pub raw_pcm: Option<Vec<i16>>, // Fallback to 16-bit PCM when compression fails
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -55,9 +58,14 @@ pub struct EncodedFrame
 {
     /// Sparse representation: (index, value) pairs for non-zero coefficients
     /// Outer vec: channel index -> inner vec: sparse coefficient data
+    /// Empty if raw_pcm is used
     pub sparse_coeffs_per_channel: Vec<Vec<(u16, i16)>>,
-    /// scale factor per channel
+    /// scale factor per channel (empty if raw_pcm is used)
     pub scale_factors: Vec<f32>,
+    /// Raw PCM data for this frame if compression is ineffective
+    /// Stores interleaved i16 samples for all channels
+    /// Length should be HOP_SIZE * channels
+    pub raw_pcm: Option<Vec<i16>>,
 }
 
 pub enum Progress 
@@ -422,7 +430,7 @@ impl Encoder
             per_chan[i % ch].push(s);
         }
 
-        // Pad per-channel (half-hop at start and end)
+        // Pad per-channel
         let mut padded: Vec<Vec<f32>> = Vec::with_capacity(ch);
         for c in 0..ch
         {
@@ -448,20 +456,24 @@ impl Encoder
 
         let tables = self.tables.clone();
         let window = self.window.clone();
-        let perceptual = self.perceptual.clone();  // Clone Arc for parallel access
+        let perceptual = self.perceptual.clone();
 
-        // For each frame index, compute per-channel coeffs in parallel across frames
+        // Encode frames in parallel, deciding per-frame whether to use compression
         let frames: Vec<EncodedFrame> = (0..num_frames).into_par_iter().map(|fi|
         {
             let mut sparse_coeffs_per_channel: Vec<Vec<(u16, i16)>> = Vec::with_capacity(ch);
             let mut scale_factors: Vec<f32> = Vec::with_capacity(ch);
+
+            // Extract raw frame samples for fallback consideration
+            // IMPORTANT: Store FRAME_SIZE samples to maintain overlap-add structure
+            let mut raw_frame_samples: Vec<i16> = Vec::with_capacity(FRAME_SIZE * ch);
 
             for c in 0..ch
             {
                 let start = fi * HOP_SIZE;
                 let slice = &padded[c][start .. start + FRAME_SIZE];
 
-                // Apply window to block
+                // Apply window
                 let mut block = vec![0.0f32; FRAME_SIZE];
                 for i in 0..FRAME_SIZE
                 {
@@ -476,81 +488,59 @@ impl Encoder
                 let max_val = coeffs.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-10);
                 scale_factors.push(max_val);
 
-                // Compute psychoacoustic masking thresholds
+                // Compute masking thresholds and compress
                 let thresholds = compute_masking_thresholds(&coeffs, QUALITY_FACTOR, &perceptual);
-
-                // compress coefficients to sparse representation
                 let sparse = compress_coefficients(&coeffs, max_val, &thresholds, NOISE_FLOOR_DB);
                 sparse_coeffs_per_channel.push(sparse);
+
+                // Collect raw samples for this channel (ENTIRE FRAME_SIZE with window applied)
+                // This maintains the overlap-add structure
+                for i in 0..FRAME_SIZE
+                {
+                    let sample = slice[i] * window[i];
+                    raw_frame_samples.push((sample * 32767.0).clamp(-32768.0, 32767.0) as i16);
+                }
             }
 
-            EncodedFrame
+            // Estimate compressed size for this frame
+            let mut compressed_size = 0usize;
+            for sparse_channel in &sparse_coeffs_per_channel
             {
-                sparse_coeffs_per_channel,
-                scale_factors,
+                // Vec length (8 bytes) + sparse entries (4 bytes each)
+                compressed_size += 8 + sparse_channel.len() * 4;
+            }
+            // Add scale factors: Vec length + f32 per channel
+            compressed_size += 8 + scale_factors.len() * 4;
+            // Add frame overhead
+            compressed_size += 64;
+
+            // Raw PCM size for this frame (i16 samples, interleaved, FRAME_SIZE per channel)
+            let raw_size = FRAME_SIZE * ch * 2; // 2 bytes per i16
+
+            // Decide: use compression or raw PCM?
+            if compressed_size as f32 >= (raw_size as f32 * COMPRESSION_THRESHOLD)
+            {
+                // Use raw PCM fallback for this frame
+                EncodedFrame
+                {
+                    sparse_coeffs_per_channel: Vec::new(),
+                    scale_factors: Vec::new(),
+                    raw_pcm: Some(raw_frame_samples),
+                }
+            }
+            else
+            {
+                // Use compression
+                EncodedFrame
+                {
+                    sparse_coeffs_per_channel,
+                    scale_factors,
+                    raw_pcm: None,
+                }
             }
         }).collect();
 
-        // Estimate encoded size
-        let mut estimated_size = 0usize;
-        for frame in &frames
-        {
-            for sparse_channel in &frame.sparse_coeffs_per_channel
-            {
-                // Each sparse entry is (u16, i16) = 4 bytes
-                // Plus bincode overhead: Vec length (8 bytes) + sparse entries
-                estimated_size += 8 + sparse_channel.len() * 4;
-            }
-            // Add scale factors: Vec length + f32 per channel
-            estimated_size += 8 + frame.scale_factors.len() * 4;
-        }
-
-        // Add significant overhead for serialization:
-        // - EncodedAudio struct
-        // - AudioHeader (sample_rate, channels, total_samples)
-        // - GaplessInfo
-        // - Vec<EncodedFrame> overhead
-        // - Option<Vec<f32>> tag
-        estimated_size += 1024 + frames.len() * 64;  // More realistic overhead
-
-        // Calculate input size in bytes (f32 = 4 bytes per sample)
-        let input_size = samples.len() * 4;
-
-        // If compressed size would be >= 90% of input, use raw PCM instead
-        // (leave some margin since estimation isn't perfect)
-        if estimated_size >= (input_size * 9 / 10)
-        {
-            eprintln!("DEBUG: Using raw PCM fallback");
-
-            // Convert f32 samples to i16 for more compact storage
-            let raw_pcm_i16: Vec<i16> = samples.iter()
-                                               .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
-                                               .collect();
-
-            // Compute padding metadata for gapless reconstruction
-            let encoder_delay = 0;  // No delay for raw PCM
-            let padding = 0;  // No padding for raw PCM
-
-            return Ok(EncodedAudio
-            {
-                header: AudioHeader
-                {
-                    sample_rate: self.sample_rate,
-                    channels,
-                    total_samples,
-                },
-                frames: Vec::new(),  // Empty frames
-                gapless_info: GaplessInfo
-                {
-                    encoder_delay,
-                    padding,
-                    original_length: total_samples,
-                },
-                raw_pcm: Some(raw_pcm_i16),  // Store as i16 PCM (2 bytes per sample)
-            });
-        }
-
-        // Compute padding metadata for gapless reconstruction
+        // Compute padding metadata
         let padded_len = padded[0].len();
         let orig_len = per_chan[0].len();
         let padding = (padded_len - orig_len - (HOP_SIZE / 2)) as u32;
@@ -571,7 +561,6 @@ impl Encoder
                 padding,
                 original_length: total_samples,
             },
-            raw_pcm: None,  // No raw PCM fallback needed
         })
     }
 }
@@ -607,51 +596,8 @@ impl Decoder
     {
         let (tx, rx) = bounded(5);
         let channels = encoded.header.channels as usize;
-
-        // Check if this is raw PCM data (i16)
-        if let Some(ref raw_pcm_i16) = encoded.raw_pcm
-        {
-            // clone it before moving into thread to avoid borrowing `encoded`
-            let raw_pcm_i16_clone = raw_pcm_i16.clone();
-            std::thread::spawn(move ||
-            {
-                if let Some(ref s) = progress_sender
-                {
-                    let _ = s.send(Progress::Status("Streaming raw PCM data".to_string()));
-                }
-
-                // Convert i16 to f32 and send in chunks
-                let chunk_size = FRAMES_PER_CHUNK * HOP_SIZE * channels;
-                for chunk_start in (0..raw_pcm_i16_clone.len()).step_by(chunk_size)
-                {
-                    let chunk_end = (chunk_start + chunk_size).min(raw_pcm_i16_clone.len());
-                    let is_last = chunk_end >= raw_pcm_i16_clone.len();
-
-                    // Convert i16 to f32
-                    let samples_f32: Vec<f32> = raw_pcm_i16_clone[chunk_start..chunk_end]
-                        .iter()
-                        .map(|&i| i as f32 / 32767.0)
-                        .collect();
-
-                    let _ = tx.send(AudioChunk {
-                        samples: samples_f32,
-                        is_last
-                    });
-                }
-
-                if let Some(ref s) = progress_sender
-                {
-                    let _ = s.send(Progress::Complete("Raw PCM streaming complete".to_string()));
-                }
-            });
-
-            return rx;
-        }
-
         let tables = self.tables.clone();
         let window = self.window.clone();
-
-        // Local overlap buffers per-thread: start from current state
         let mut overlap = vec![vec![0.0f32; HOP_SIZE]; channels];
 
         std::thread::spawn(move ||
@@ -666,46 +612,70 @@ impl Decoder
             let mut chunk_samples: Vec<f32> = Vec::with_capacity(FRAMES_PER_CHUNK * HOP_SIZE * channels);
             let mut idx = 0usize;
 
-            while idx < total_frames 
+            while idx < total_frames
             {
                 let batch_end = (idx + DECODE_BATCH).min(total_frames);
 
-                // Decode frames in parallel across the batch
+                // Decode frames in parallel
                 let batch_results: Vec<(usize, Vec<Vec<f32>>)> = (idx..batch_end).into_par_iter().map(|fi|
                 {
                     let frame = &encoded.frames[fi];
                     let mut per_channel_blocks: Vec<Vec<f32>> = Vec::with_capacity(channels);
 
-                    for ch in 0..channels
+                    // Check if this frame uses raw PCM
+                    if let Some(ref raw_pcm) = frame.raw_pcm
                     {
-                        // Reconstruct coefficients from sparse representation
-                        let mut coeffs = vec![0.0f32; tables.n];
-                        let sparse_data = &frame.sparse_coeffs_per_channel[ch];
-                        let scale = frame.scale_factors[ch].max(1e-12);
-
-                        // Use same denominator as encoder
-                        let max_q = (1u32 << (QUANTIZATION_BITS - 1)) as f32;
-
-                        // Fill in non-zero coefficients
-                        for &(index, quantized_val) in sparse_data
+                        // Decode raw PCM: deinterleave and convert i16 to f32
+                        for ch in 0..channels
                         {
-                            if (index as usize) < tables.n
+                            let mut channel_block = vec![0.0f32; FRAME_SIZE];
+                            // Fill first FRAME_SIZE with decoded samples
+                            for i in 0..FRAME_SIZE
                             {
-                                coeffs[index as usize] = (quantized_val as f32 / max_q) * scale;
+                                let sample_idx = i * channels + ch;
+                                if sample_idx < raw_pcm.len()
+                                {
+                                    channel_block[i] = raw_pcm[sample_idx] as f32 / 32767.0;
+                                }
                             }
+
+                            per_channel_blocks.push(channel_block);
                         }
-
-                        // IMDCT to FRAME_SIZE
-                        let mut out_block = vec![0.0f32; FRAME_SIZE];
-                        tables.imdct_block(&coeffs, &mut out_block);
-
-                        // Apply window
-                        for i in 0..FRAME_SIZE
+                    }
+                    else
+                    {
+                        // Decode using MDCT
+                        for ch in 0..channels
                         {
-                            out_block[i] *= window[i];
-                        }
+                            // Reconstruct coefficients from sparse representation
+                            let mut coeffs = vec![0.0f32; tables.n];
+                            let sparse_data = &frame.sparse_coeffs_per_channel[ch];
+                            let scale = frame.scale_factors[ch].max(1e-12);
 
-                        per_channel_blocks.push(out_block);
+                            // use same denominator as encoder
+                            let max_q = (1u32 << (QUANTIZATION_BITS - 1)) as f32;
+
+                            // Fill in non-zero coefficients
+                            for &(index, quantized_val) in sparse_data
+                            {
+                                if (index as usize) < tables.n
+                                {
+                                    coeffs[index as usize] = (quantized_val as f32 / max_q) * scale;
+                                }
+                            }
+
+                            // IMDCT to FRAME_SIZE
+                            let mut out_block = vec![0.0f32; FRAME_SIZE];
+                            tables.imdct_block(&coeffs, &mut out_block);
+
+                            // Apply window
+                            for i in 0..FRAME_SIZE
+                            {
+                                out_block[i] *= window[i];
+                            }
+
+                            per_channel_blocks.push(out_block);
+                        }
                     }
 
                     (fi, per_channel_blocks)
@@ -715,31 +685,29 @@ impl Decoder
                 let mut batch_results = batch_results;
                 batch_results.sort_unstable_by_key(|(fi, _)| *fi);
 
-                for (_fi, per_channel_blocks) in batch_results.into_iter() 
+                for (_fi, per_channel_blocks) in batch_results.into_iter()
                 {
-                    // For each frame, do per-channel overlap-add,
-                    // produce HOP_SIZE samples per-channel, then interleave them
-                    // accumulate interleaved HOP_SIZE * channels samples into chunk_samples
-                    for i in 0..HOP_SIZE 
+                    // Overlap-add and interleave
+                    for i in 0..HOP_SIZE
                     {
-                        for ch in 0..channels 
+                        for ch in 0..channels
                         {
                             let val = overlap[ch][i] + per_channel_blocks[ch][i];
                             chunk_samples.push(val);
                         }
                     }
 
-                    // update overlap buffers with second half of each channel
-                    for ch in 0..channels 
+                    // Update overlap buffers
+                    for ch in 0..channels
                     {
                         let second_half = &per_channel_blocks[ch][HOP_SIZE..FRAME_SIZE];
                         overlap[ch].copy_from_slice(second_half);
                     }
 
                     // periodically flush chunk
-                    if chunk_samples.len() >= FRAMES_PER_CHUNK * HOP_SIZE * channels 
+                    if chunk_samples.len() >= FRAMES_PER_CHUNK * HOP_SIZE * channels
                     {
-                        if let Some(ref s) = progress_sender 
+                        if let Some(ref s) = progress_sender
                         {
                             let progress = (idx as f32) / (total_frames as f32) * 100.0;
                             let _ = s.send(Progress::Decoding(progress));
@@ -751,10 +719,10 @@ impl Decoder
                 }
             }
 
-            // after all frames, append final overlap tails interleaved
-            for i in 0..HOP_SIZE 
+            // Final overlap
+            for i in 0..HOP_SIZE
             {
-                for ch in 0..channels 
+                for ch in 0..channels
                 {
                     chunk_samples.push(overlap[ch][i]);
                 }
@@ -763,7 +731,7 @@ impl Decoder
             // send last chunk
             let _ = tx.send(AudioChunk { samples: chunk_samples.clone(), is_last: true });
 
-            if let Some(ref s) = progress_sender 
+            if let Some(ref s) = progress_sender
             {
                 let _ = s.send(Progress::Complete(format!("Decoded {} frames in {:.2}s", total_frames, start_time.elapsed().as_secs_f32())));
             }
