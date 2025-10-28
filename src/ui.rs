@@ -1,5 +1,6 @@
 use crate::codec::{Encoder, Decoder, EncodedAudio, save_encoded, load_encoded, Progress};
 use crate::audio::load_audio_file_lossless;
+use crate::playback::SamplesSource;
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -725,68 +726,3 @@ impl eframe::App for CodecApp
     }
 }
 
-// Custom audio source for rodio
-pub(crate) struct SamplesSource
-{
-    samples: Vec<f32>,
-    sample_rate: u32,
-    channels: u16,
-    position: usize,
-}
-
-impl SamplesSource 
-{
-    pub(crate) fn new(samples: Vec<f32>, sample_rate: u32, channels: u16) -> Self
-    {
-        Self 
-        {
-            samples,
-            sample_rate,
-            channels,
-            position: 0,
-        }
-    }
-}
-
-impl Iterator for SamplesSource 
-{
-    type Item = f32;
-    
-    fn next(&mut self) -> Option<Self::Item> 
-    {
-        if self.position < self.samples.len() 
-        {
-            let sample = self.samples[self.position];
-            self.position += 1;
-            Some(sample)
-        } else 
-        {
-            None
-        }
-    }
-}
-
-impl Source for SamplesSource 
-{
-    fn current_frame_len(&self) -> Option<usize> 
-    {
-        None
-    }
-    
-    fn channels(&self) -> u16 
-    {
-        self.channels
-    }
-    
-    fn sample_rate(&self) -> u32 
-    {
-        self.sample_rate
-    }
-    
-    fn total_duration(&self) -> Option<Duration> 
-    {
-        Some(Duration::from_secs_f32(
-            self.samples.len() as f32 / (self.sample_rate as f32 * self.channels as f32)
-        ))
-    }
-}

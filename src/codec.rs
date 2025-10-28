@@ -25,11 +25,12 @@ const MIN_QUANTIZATION_BITS: u32 = 8;  // Use fewer bits for less important coef
 const MAX_QUANTIZATION_BITS: u32 = 16;  // Full resolution for important coefficients
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct EncodedAudio 
+pub struct EncodedAudio
 {
     pub header: AudioHeader,
-    pub frames: Vec<EncodedFrame>, // time-ordered frames
+    pub frames: Vec<EncodedFrame>, // time-ordered frames (empty if raw_pcm is used)
     pub gapless_info: GaplessInfo,
+    pub raw_pcm: Option<Vec<i16>>, // Fallback to 16-bit PCM when compression fails
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -490,6 +491,65 @@ impl Encoder
             }
         }).collect();
 
+        // Estimate encoded size
+        let mut estimated_size = 0usize;
+        for frame in &frames
+        {
+            for sparse_channel in &frame.sparse_coeffs_per_channel
+            {
+                // Each sparse entry is (u16, i16) = 4 bytes
+                // Plus bincode overhead: Vec length (8 bytes) + sparse entries
+                estimated_size += 8 + sparse_channel.len() * 4;
+            }
+            // Add scale factors: Vec length + f32 per channel
+            estimated_size += 8 + frame.scale_factors.len() * 4;
+        }
+
+        // Add significant overhead for serialization:
+        // - EncodedAudio struct
+        // - AudioHeader (sample_rate, channels, total_samples)
+        // - GaplessInfo
+        // - Vec<EncodedFrame> overhead
+        // - Option<Vec<f32>> tag
+        estimated_size += 1024 + frames.len() * 64;  // More realistic overhead
+
+        // Calculate input size in bytes (f32 = 4 bytes per sample)
+        let input_size = samples.len() * 4;
+
+        // If compressed size would be >= 90% of input, use raw PCM instead
+        // (leave some margin since estimation isn't perfect)
+        if estimated_size >= (input_size * 9 / 10)
+        {
+            eprintln!("DEBUG: Using raw PCM fallback");
+
+            // Convert f32 samples to i16 for more compact storage
+            let raw_pcm_i16: Vec<i16> = samples.iter()
+                                               .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
+                                               .collect();
+
+            // Compute padding metadata for gapless reconstruction
+            let encoder_delay = 0;  // No delay for raw PCM
+            let padding = 0;  // No padding for raw PCM
+
+            return Ok(EncodedAudio
+            {
+                header: AudioHeader
+                {
+                    sample_rate: self.sample_rate,
+                    channels,
+                    total_samples,
+                },
+                frames: Vec::new(),  // Empty frames
+                gapless_info: GaplessInfo
+                {
+                    encoder_delay,
+                    padding,
+                    original_length: total_samples,
+                },
+                raw_pcm: Some(raw_pcm_i16),  // Store as i16 PCM (2 bytes per sample)
+            });
+        }
+
         // Compute padding metadata for gapless reconstruction
         let padded_len = padded[0].len();
         let orig_len = per_chan[0].len();
@@ -511,6 +571,7 @@ impl Encoder
                 padding,
                 original_length: total_samples,
             },
+            raw_pcm: None,  // No raw PCM fallback needed
         })
     }
 }
@@ -542,21 +603,62 @@ impl Decoder
     }
 
     /// Decode frames in batch-parallel fashion, producing interleaved chunks
-    pub fn decode_streaming(&mut self, encoded: Arc<EncodedAudio>, progress_sender: Option<Sender<Progress>>) -> Receiver<AudioChunk> 
+    pub fn decode_streaming(&mut self, encoded: Arc<EncodedAudio>, progress_sender: Option<Sender<Progress>>) -> Receiver<AudioChunk>
     {
         let (tx, rx) = bounded(5);
         let channels = encoded.header.channels as usize;
+
+        // Check if this is raw PCM data (i16)
+        if let Some(ref raw_pcm_i16) = encoded.raw_pcm
+        {
+            // clone it before moving into thread to avoid borrowing `encoded`
+            let raw_pcm_i16_clone = raw_pcm_i16.clone();
+            std::thread::spawn(move ||
+            {
+                if let Some(ref s) = progress_sender
+                {
+                    let _ = s.send(Progress::Status("Streaming raw PCM data".to_string()));
+                }
+
+                // Convert i16 to f32 and send in chunks
+                let chunk_size = FRAMES_PER_CHUNK * HOP_SIZE * channels;
+                for chunk_start in (0..raw_pcm_i16_clone.len()).step_by(chunk_size)
+                {
+                    let chunk_end = (chunk_start + chunk_size).min(raw_pcm_i16_clone.len());
+                    let is_last = chunk_end >= raw_pcm_i16_clone.len();
+
+                    // Convert i16 to f32
+                    let samples_f32: Vec<f32> = raw_pcm_i16_clone[chunk_start..chunk_end]
+                        .iter()
+                        .map(|&i| i as f32 / 32767.0)
+                        .collect();
+
+                    let _ = tx.send(AudioChunk {
+                        samples: samples_f32,
+                        is_last
+                    });
+                }
+
+                if let Some(ref s) = progress_sender
+                {
+                    let _ = s.send(Progress::Complete("Raw PCM streaming complete".to_string()));
+                }
+            });
+
+            return rx;
+        }
+
         let tables = self.tables.clone();
         let window = self.window.clone();
 
         // Local overlap buffers per-thread: start from current state
         let mut overlap = vec![vec![0.0f32; HOP_SIZE]; channels];
 
-        std::thread::spawn(move || 
+        std::thread::spawn(move ||
         {
             let start_time = Instant::now();
             let total_frames = encoded.frames.len();
-            if let Some(ref s) = progress_sender 
+            if let Some(ref s) = progress_sender
             {
                 let _ = s.send(Progress::Status(format!("Starting streaming decode of {} frames", total_frames)));
             }

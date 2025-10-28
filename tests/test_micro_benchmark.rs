@@ -230,7 +230,16 @@ fn analyze_coefficient_distribution()
         let min = *coeff_counts.first().unwrap_or(&0);
         let max = *coeff_counts.last().unwrap_or(&0);
         let avg: f64 = coeff_counts.iter().sum::<usize>() as f64 / coeff_counts.len() as f64;
-        let median = coeff_counts[coeff_counts.len() / 2];
+
+        let median = if coeff_counts.len() > 0
+        {
+            coeff_counts[coeff_counts.len() / 2]
+        }
+        else
+        {
+            // If the data was raw PCM, coeffs is empty
+            0usize
+        };
 
         println!("  {:15} - min: {:4}, max: {:4}, avg: {:6.1}, median: {:4}",
                  name, min, max, avg, median);

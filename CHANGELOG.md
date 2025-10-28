@@ -1,10 +1,10 @@
-## Version 0.4.2
+## Version 0.4.1
+- Fall back to raw PCM if encoded file size would be larger than input
 - Add command line options to decode a `.glc` file
   - Add `playback` feature to enable `rodio` for native Rust playback without a GUI
   - Use `ffplay` as a fallback option (buggy, will investigate)
   - Add option to save decoded as flac or wav
-
-## Version 0.4.1
+  - Move definition of `SamplesSource` to new `src/playback.rs` module
 - Allow encoding files using the `glc` binary without needing to have the `ui` feature enabled
 - Don't try to link `libFLAC` if the `flac-export` feature is not enabled
 

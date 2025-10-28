@@ -12,7 +12,9 @@ use std::sync::Arc;
 use eframe::egui;
 
 #[cfg(feature = "playback")]
-use ui::SamplesSource;
+mod playback;
+#[cfg(feature = "playback")]
+use playback::SamplesSource;
 
 /// Encode a single audio file (WAV or FLAC) to GLC format
 fn encode_file(input_path: PathBuf) -> Result<(), anyhow::Error>
