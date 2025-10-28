@@ -25,7 +25,8 @@ flac-bound = { version = "0.5", optional = true }
 [features]
 default = ["flac-export", "ui"]
 flac-export = ["flac-bound"]
-ui = ["eframe", "egui", "rfd", "rodio"]
+playback = ["rodio"]
+ui = ["eframe", "egui", "rfd", "playback"]
 
 [[bin]]
 name = "glc"

@@ -85,6 +85,34 @@ pub fn generate_frequency_sweep(start_freq: f32, end_freq: f32, sample_rate: u32
     samples
 }
 
+/// Generate white noise (random samples)
+pub fn generate_white_noise(sample_rate: u32, channels: u16, duration_seconds: f32, seed: u64) -> Vec<f32>
+{
+    // Simple LCG pseudorandom number generator for deterministic noise
+    let mut state = seed;
+    let mut next_random = || -> f32
+        {
+            // LCG parameters from Numerical Recipes
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            // Convert to float in range [-0.3, 0.3]
+            let normalized = (state as f32) / (u64::MAX as f32);
+            (normalized - 0.5) * 0.6
+        };
+
+    let total_samples = (sample_rate as f32 * duration_seconds) as usize;
+    let mut samples = Vec::with_capacity(total_samples * channels as usize);
+
+    for _ in 0..total_samples
+    {
+        for _ in 0..channels
+        {
+            samples.push(next_random());
+        }
+    }
+
+    samples
+}
+
 /// Calculate Signal-to-Noise Ratio between original and decoded audio
 /// Skips initial and final transients to avoid edge effects
 pub fn calculate_snr(original: &[f32], decoded: &[f32]) -> f32

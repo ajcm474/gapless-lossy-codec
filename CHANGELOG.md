@@ -1,3 +1,9 @@
+## Version 0.4.2
+- Add command line options to decode a `.glc` file
+  - Add `playback` feature to enable `rodio` for native Rust playback without a GUI
+  - Use `ffplay` as a fallback option (buggy, will investigate)
+  - Add option to save decoded as flac or wav
+
 ## Version 0.4.1
 - Allow encoding files using the `glc` binary without needing to have the `ui` feature enabled
 - Don't try to link `libFLAC` if the `flac-export` feature is not enabled

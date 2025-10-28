@@ -726,7 +726,7 @@ impl eframe::App for CodecApp
 }
 
 // Custom audio source for rodio
-struct SamplesSource 
+pub(crate) struct SamplesSource
 {
     samples: Vec<f32>,
     sample_rate: u32,
@@ -736,7 +736,7 @@ struct SamplesSource
 
 impl SamplesSource 
 {
-    fn new(samples: Vec<f32>, sample_rate: u32, channels: u16) -> Self 
+    pub(crate) fn new(samples: Vec<f32>, sample_rate: u32, channels: u16) -> Self
     {
         Self 
         {
