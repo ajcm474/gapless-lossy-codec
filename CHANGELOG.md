@@ -1,3 +1,10 @@
+## Version 0.5.0
+- Implement pure Rust FLAC encoding in order to remove `libFLAC` dependency
+- Remove `flac-export` feature as flac export is now possible natively
+- Add support for specifying flac compression level (0-8) in both CLI and GUI
+- Add ability to decode and playback multiple files at once on the command line
+- Disable all features by default since the UI is mainly for debugging at this point
+
 ## Version 0.4.1
 - Fall back to raw PCM if encoded file size would be larger than input
 - Add command line options to decode a `.glc` file

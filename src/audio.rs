@@ -5,8 +5,6 @@ use hound;
 use claxon;
 use crate::flac as pure_flac;
 
-#[cfg(feature = "flac-export")]
-use flac_bound::{FlacEncoder, WriteWrapper};
 
 /// Helper function to convert f32 samples to i16
 /// For each f32 sample, multiply by i16 max, then clamp to valid i16 range
@@ -84,55 +82,7 @@ fn load_flac(path: &Path) -> Result<(Vec<f32>, u32, u16)>
     Ok((samples, info.sample_rate, info.channels as u16))
 }
 
-/// Export `samples` to `Path` using FLAC encoding (old implementation using flac-bound)
-/// Uses 16-bit depth and a compression level of 5
-#[cfg(feature = "flac-export")]
-pub fn export_to_flac_old(
-    path: &Path,
-    samples: &[f32],
-    sample_rate: u32,
-    channels: u16,
-) -> Result<()>
-{
-    let mut file = std::fs::File::create(path)?;
-    let mut write_wrapper = WriteWrapper(&mut file);
-
-    // Add FLAC headers
-    let mut encoder = FlacEncoder::new()
-        .ok_or_else(|| anyhow!("Failed to create FLAC encoder"))?
-        .channels(channels as u32)
-        .bits_per_sample(16)
-        .sample_rate(sample_rate)
-        .compression_level(5)
-        .init_write(&mut write_wrapper)
-        .map_err(|e| anyhow!("Failed to initialize FLAC encoder: {:?}", e))?;
-
-    // FLAC encoder expects samples in range appropriate for bits_per_sample
-    let num_frames = samples.len() / channels as usize;
-
-    // Deinterleave and convert f32 samples to i32
-    let mut channel_buffers: Vec<Vec<i32>> = vec![Vec::with_capacity(num_frames); channels as usize];
-    for (i, &sample) in samples.iter().enumerate()
-    {
-        let channel = i % channels as usize;
-        let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i32;
-        channel_buffers[channel].push(s);
-    }
-
-    // Convert to slice references for process()
-    let channel_refs: Vec<&[i32]> = channel_buffers.iter().map(|v| v.as_slice()).collect();
-
-    // Process all frames at once
-    encoder.process(&channel_refs)
-           .map_err(|_| anyhow!("Failed to process FLAC frames"))?;
-
-    encoder.finish()
-           .map_err(|e| anyhow!("Failed to finish FLAC encoding: {:?}", e))?;
-
-    Ok(())
-}
-
-/// Export `samples` to `Path` using FLAC encoding (new pure Rust implementation)
+/// Export `samples` to `Path` using FLAC encoding (pure Rust implementation)
 /// Uses 16-bit depth and a compression level of 5
 pub fn export_to_flac(
     path: &Path,

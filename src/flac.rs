@@ -11,9 +11,6 @@ const FLAC_SIGNATURE: [u8; 4] = [0x66, 0x4C, 0x61, 0x43]; // "fLaC"
 /// Maximum Rice parameter value for 4-bit encoding
 const MAX_RICE_PARAM_4BIT: u32 = 14;
 
-/// Maximum Rice parameter value for 5-bit encoding
-const MAX_RICE_PARAM_5BIT: u32 = 30;
-
 /// Frame sync code
 const FRAME_SYNC_CODE: u16 = 0x3FFE;
 
@@ -587,29 +584,28 @@ fn encode_rice_partition(writer: &mut BitWriter, residual: &[i32], rice_param: u
 }
 
 /// Encode residual with partitioned Rice coding
-fn encode_residual(writer: &mut BitWriter, residual: &[i32], predictor_order: usize, block_size: usize) -> Result<()>
+fn encode_residual(writer: &mut BitWriter, residual: &[i32], predictor_order: usize, block_size: usize, compression_level: u8) -> Result<()>
 {
-    // Calculate a safe partition order
-    // The partition order must ensure that:
-    // 1. block_size >> partition_order > predictor_order (for first partition)
-    // 2. partition_order <= 15 (4-bit field)
-
-    let mut partition_order = 0u32;
-    let max_partition_order = 15u32.min((block_size.trailing_zeros()).min(8));
-
-    // Find the best partition order
-    while partition_order < max_partition_order
+    // Calculate partition order based on compression level
+    let mut partition_order = match compression_level
     {
-        let partition_samples = block_size >> (partition_order + 1);
-        if partition_samples <= predictor_order || partition_samples < 4
+        0 => 0,
+        1..=2 => 2.min((block_size.trailing_zeros()).min(8)),
+        3..=5 => 4.min((block_size.trailing_zeros()).min(8)),
+        6..=8 => 6.min((block_size.trailing_zeros()).min(8)),
+        _ => 6.min((block_size.trailing_zeros()).min(8)),
+    };
+
+    // Ensure valid partition order
+    while partition_order > 0
+    {
+        let partition_samples = block_size >> partition_order;
+        if partition_samples > predictor_order && partition_samples >= 4
         {
             break;
         }
-        partition_order += 1;
+        partition_order -= 1;
     }
-
-    // For simplicity with compression level 5, limit to reasonable values
-    partition_order = partition_order.min(6);
 
     // Write coding method (0b00 for 4-bit Rice parameters)
     writer.write_bits(0, 2);
@@ -688,13 +684,20 @@ fn encode_residual(writer: &mut BitWriter, residual: &[i32], predictor_order: us
 }
 
 /// Encode a subframe
-fn encode_subframe(writer: &mut BitWriter, samples: &[i32], bits_per_sample: u8) -> Result<()>
+fn encode_subframe(writer: &mut BitWriter, samples: &[i32], bits_per_sample: u8, compression_level: u8) -> Result<()>
 {
     let block_size = samples.len();
 
-    // For compression level 5, try different predictor orders and choose best
-    // Here we'll use fixed predictor order 3 as a reasonable default
-    let predictor_order = if block_size >= 4 { 3 } else { 0 };
+    // Choose predictor order based on compression level
+    let predictor_order = match compression_level
+    {
+        0 => 0, // Verbatim (no prediction)
+        1 => if block_size >= 1 { 1 } else { 0 },
+        2 => if block_size >= 2 { 2 } else { 0 },
+        3..=4 => if block_size >= 3 { 3 } else { 0 },
+        5..=8 => if block_size >= 4 { 4 } else { 0 },
+        _ => if block_size >= 4 { 4 } else { 0 },
+    };
 
     // Write subframe header
     // Bits 0: Zero bit
@@ -735,7 +738,7 @@ fn encode_subframe(writer: &mut BitWriter, samples: &[i32], bits_per_sample: u8)
         // Calculate and encode residual
         let residual = apply_fixed_predictor(samples, predictor_order);
         // Pass the entire residual but encoding starts after warm-up samples
-        encode_residual(writer, &residual[predictor_order..], predictor_order, block_size)?;
+        encode_residual(writer, &residual[predictor_order..], predictor_order, block_size, compression_level)?;
     }
 
     Ok(())
@@ -750,6 +753,7 @@ fn encode_frame(
     bits_per_sample: u8,
     frame_number: u32,
     block_size: usize,
+    compression_level: u8,
 ) -> Result<()>
 {
     let frame_start = writer.buffer.len();
@@ -885,7 +889,7 @@ fn encode_frame(
     // Encode each channel
     for ch in 0..channels as usize
     {
-        encode_subframe(writer, &channel_samples[ch], bits_per_sample)?;
+        encode_subframe(writer, &channel_samples[ch], bits_per_sample, compression_level)?;
     }
 
     // Byte-align
@@ -939,11 +943,12 @@ fn write_streaminfo(
     }
 }
 
-/// Main FLAC encoding function
-pub fn encode_flac(
+/// Main FLAC encoding function with compression level
+pub fn encode_flac_with_level(
     samples: &[f32],
     sample_rate: u32,
     channels: u16,
+    compression_level: u8,
 ) -> Result<Vec<u8>>
 {
     // Convert f32 samples to i16
@@ -962,11 +967,33 @@ pub fn encode_flac(
             total_samples
         ));
     }
+
+    // Validate compression level
+    if compression_level > 8
+    {
+        return Err(anyhow!(
+            "Invalid compression level {}, must be 0-8",
+            compression_level
+        ));
+    }
+
     let bits_per_sample = 16u8;
 
-    // For compression level 5, typical block size is 4096
-    // FLAC requires minimum block size of 16
-    let block_size = 4096usize.min(total_samples).max(16);
+    // Choose block size based on compression level
+    let block_size = match compression_level
+    {
+        0 => 1152,  // Fast encoding
+        1 => 1152,
+        2 => 1152,
+        3 => 4096,
+        4 => 4096,
+        5 => 4096,  // Default
+        6 => 4096,
+        7 => 4096,
+        8 => 4096,  // Maximum compression
+        _ => 4096,
+    }.min(total_samples).max(16);
+
 
     let mut writer = BitWriter::new();
 
@@ -1014,6 +1041,7 @@ pub fn encode_flac(
             bits_per_sample,
             frame_number,
             current_block_size,
+            compression_level,
         )?;
 
         sample_offset += current_block_size * channels as usize;
@@ -1023,7 +1051,32 @@ pub fn encode_flac(
     Ok(writer.get_bytes())
 }
 
-/// Export audio to FLAC file (new implementation)
+/// Main FLAC encoding function with default compression level 5
+pub fn encode_flac(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+) -> Result<Vec<u8>>
+{
+    encode_flac_with_level(samples, sample_rate, channels, 5)
+}
+
+/// Export audio to FLAC file with specific compression level
+pub fn export_to_flac_with_level(
+    path: &Path,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+    compression_level: u8,
+) -> Result<()>
+{
+    let flac_data = encode_flac_with_level(samples, sample_rate, channels, compression_level)?;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(&flac_data)?;
+    Ok(())
+}
+
+/// Export audio to FLAC file with default compression level 5
 pub fn export_to_flac(
     path: &Path,
     samples: &[f32],
@@ -1031,8 +1084,5 @@ pub fn export_to_flac(
     channels: u16,
 ) -> Result<()>
 {
-    let flac_data = encode_flac(samples, sample_rate, channels)?;
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(&flac_data)?;
-    Ok(())
+    export_to_flac_with_level(path, samples, sample_rate, channels, 5)
 }

@@ -16,7 +16,7 @@ glc <file1.wav> [file2.wav] [file3.flac] ...
 ### Supported Formats
 
 - WAV files (`.wav`)
-- FLAC files (`.flac`) if `flac-export` feature [is enabled](#features-overview)
+- FLAC files (`.flac`)
 
 ### Behavior
 
@@ -60,11 +60,21 @@ Saved: "test.glc" (7014 bytes, 4.0% of original)
 ```
 
 ## Command-Line Usage (Decoding)
-Decode a file and save output
+Decode a file and save output (FLAC by default)
 ```bash
 glc -d file.glc
 ```
-Creates `file.wav` (or `file.flac` if `flac-export` is enabled)
+Creates `file.flac` with default compression level 5
+
+Decode with specific FLAC compression level (0-8)
+```bash
+glc -d --flac-level 8 file.glc
+```
+
+Decode to WAV format instead
+```bash
+glc -d --wav file.glc
+```
 
 Decode a file and play it back using a pure Rust implementation 
 (requires `playback` or `ui` feature to be enabled):
@@ -78,23 +88,28 @@ glc -p file.glc --ffplay
 ```
 
 ## Features Overview
-All features are enabled by default. 
-To enable only some features, include `--no-default-features` in the build command.
+No features are enabled by default for a minimal command-line build.
+You can enable specific features as needed.
 
-### Build with all features (default)
+### Build with default settings (command-line only)
 ```bash
 cargo build --release
 ```
-Requires system libraries: glib-2.0, libFLAC, alsa (might be Linux only?)
+Produces a minimal binary with encoding/decoding capabilities only.
 
-### Disable all features (no GUI or flac export capability)
+### Build with GUI support
 ```bash
-cargo build --release --no-default-features
+cargo build --release --features ui
 ```
-Produces a smaller binary useful for encoding and decoding at the command line.
+Includes GUI support. May require system libraries for GUI (glib-2.0) and audio playback (alsa on Linux).
 
-### Disable GUI but keep flac export
+### Build with playback support (no GUI)
 ```bash
-cargo build --release --no-default-features --features flac-export
+cargo build --release --features playback
 ```
-Requires libFLAC
+Enables audio playback through the command line using rodio.
+
+### FLAC Support
+FLAC encoding and decoding is now implemented in pure Rust, requiring no external libraries.
+The encoder supports compression levels 0-8, with level 5 as the default.
+This implementation follows RFC 9639 and produces standard-compliant FLAC files.

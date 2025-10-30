@@ -11,9 +11,6 @@ use crossbeam_channel::{bounded, Sender, Receiver};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::BufWriter;
-
-#[cfg(feature = "flac-export")]
-use flac_bound::{FlacEncoder, WriteWrapper};
 use hound;
 
 pub struct CodecApp 
@@ -37,11 +34,14 @@ pub struct CodecApp
     
     // Channels for background tasks
     progress_receiver: Option<Receiver<Progress>>,
-    
+
     // Audio device testing
     test_file_path: Option<PathBuf>,
     available_devices: Vec<String>,
     selected_device: usize,
+
+    // FLAC compression level
+    flac_compression_level: u8,
 }
 
 impl CodecApp 
@@ -73,6 +73,7 @@ impl CodecApp
             test_file_path: None,
             available_devices: vec!["Default".to_string()],
             selected_device: 0,
+            flac_compression_level: 5, // Default to level 5
         }
     }
     
@@ -293,120 +294,111 @@ impl CodecApp
         let status = self.status.clone();
         let detailed_status = self.detailed_status.clone();
         let export_progress = self.export_progress.clone();
+        let flac_level = self.flac_compression_level;
 
         std::thread::spawn(move ||
+        {
+            let start_time = Instant::now();
+            *export_progress.lock().unwrap() = Some(0.0);
+            *status.lock().unwrap() = "Starting export...".to_string();
+
+            // Collect all decoded samples first, then write to FLAC at once
+            let mut all_samples: Vec<f32> = Vec::new();
+            let mut sample_rate = 0u32;
+            let mut channels = 0u16;
+            let total_files = playlist.len();
+
+            for (file_idx, path) in playlist.iter().enumerate()
             {
-                let start_time = Instant::now();
-                *export_progress.lock().unwrap() = Some(0.0);
-                *status.lock().unwrap() = "Starting export...".to_string();
+                let base_progress = (file_idx as f32 / total_files as f32) * 100.0;
+                *export_progress.lock().unwrap() = Some(base_progress);
+                *status.lock().unwrap() = format!("Loading file {}/{}", file_idx + 1, total_files);
 
-                // Collect all decoded samples first, then write to FLAC at once
-                let mut all_samples: Vec<f32> = Vec::new();
-                let mut sample_rate = 0u32;
-                let mut channels = 0u16;
-                let total_files = playlist.len();
-
-                for (file_idx, path) in playlist.iter().enumerate()
+                match crate::codec::load_encoded(path)
                 {
-                    let base_progress = (file_idx as f32 / total_files as f32) * 100.0;
-                    *export_progress.lock().unwrap() = Some(base_progress);
-                    *status.lock().unwrap() = format!("Loading file {}/{}", file_idx + 1, total_files);
-
-                    match crate::codec::load_encoded(path)
+                    Ok(encoded) =>
                     {
-                        Ok(encoded) =>
+                        *detailed_status.lock().unwrap() = format!(
+                            "Processing {:?}: {} frames",
+                            path.file_name().unwrap(),
+                            encoded.frames.len()
+                        );
+
+                        // Get sample rate and channels from first file
+                        if file_idx == 0
+                        {
+                            sample_rate = encoded.header.sample_rate;
+                            channels = encoded.header.channels;
+                        }
+
+                        // Create decoder for this file using its native channels & sample_rate
+                        let mut decoder = crate::codec::Decoder::new(
+                            encoded.header.channels as usize,
+                            encoded.header.sample_rate,
+                        );
+
+                        // Use synchronous decode convenience (it internally uses streaming)
+                        match decoder.decode(&encoded, None)
+                        {
+                            Ok(samples) =>
                             {
-                                *detailed_status.lock().unwrap() = format!(
-                                    "Processing {:?}: {} frames",
-                                    path.file_name().unwrap(),
-                                    encoded.frames.len()
+                                all_samples.extend_from_slice(&samples);
+                                *status.lock().unwrap() = format!(
+                                    "Decoded file {}/{} ({} samples)",
+                                    file_idx + 1,
+                                    total_files,
+                                    samples.len()
                                 );
-
-                                // Get sample rate and channels from first file
-                                if file_idx == 0
-                                {
-                                    sample_rate = encoded.header.sample_rate;
-                                    channels = encoded.header.channels;
-                                }
-
-                                // Create decoder for this file using its native channels & sample_rate
-                                let mut decoder = crate::codec::Decoder::new(
-                                    encoded.header.channels as usize,
-                                    encoded.header.sample_rate,
-                                );
-
-                                // Use synchronous decode convenience (it internally uses streaming)
-                                match decoder.decode(&encoded, None)
-                                {
-                                    Ok(samples) =>
-                                        {
-                                            all_samples.extend_from_slice(&samples);
-                                            *status.lock().unwrap() = format!(
-                                                "Decoded file {}/{} ({} samples)",
-                                                file_idx + 1,
-                                                total_files,
-                                                samples.len()
-                                            );
-                                        }
-                                    Err(e) =>
-                                        {
-                                            *status.lock().unwrap() = format!("Decoding error: {}", e);
-                                            *export_progress.lock().unwrap() = None;
-                                            return;
-                                        }
-                                }
                             }
-                        Err(e) =>
+                            Err(e) =>
                             {
-                                *status.lock().unwrap() = format!("Error loading file: {}", e);
+                                *status.lock().unwrap() = format!("Decoding error: {}", e);
                                 *export_progress.lock().unwrap() = None;
                                 return;
                             }
-                    }
-                }
-
-                // Export all samples to FLAC or WAV based on feature
-                *status.lock().unwrap() = "Writing audio file...".to_string();
-                *export_progress.lock().unwrap() = Some(95.0);
-
-                #[cfg(feature = "flac-export")]
-                let export_result = crate::audio::export_to_flac(&output_path, &all_samples, sample_rate, channels);
-
-                #[cfg(not(feature = "flac-export"))]
-                let export_result =
-                {
-                    // Change .flac extension to .wav if FLAC not available
-                    let wav_path = if output_path.extension().and_then(|e| e.to_str()) == Some("flac")
-                    {
-                        output_path.with_extension("wav")
-                    }
-                    else
-                    {
-                        output_path.clone()
-                    };
-                    crate::audio::export_to_wav(&wav_path, &all_samples, sample_rate, channels)
-                };
-
-                match export_result
-                {
-                    Ok(()) =>
-                    {
-                        let elapsed = start_time.elapsed();
-                        *status.lock().unwrap() = format!(
-                            "Exported {} samples to {:?} in {:.2}s",
-                            all_samples.len(),
-                            output_path.file_name().unwrap(),
-                            elapsed.as_secs_f32()
-                        );
+                        }
                     }
                     Err(e) =>
                     {
-                        *status.lock().unwrap() = format!("Error exporting audio: {}", e);
+                        *status.lock().unwrap() = format!("Error loading file: {}", e);
                         *export_progress.lock().unwrap() = None;
                         return;
                     }
                 }
-            });
+            }
+
+            // Export all samples to FLAC
+            *status.lock().unwrap() = "Writing audio file...".to_string();
+            *export_progress.lock().unwrap() = Some(95.0);
+
+            let export_result = crate::flac::export_to_flac_with_level(
+                &output_path,
+                &all_samples,
+                sample_rate,
+                channels,
+                flac_level
+            );
+
+            match export_result
+            {
+                Ok(()) =>
+                {
+                    let elapsed = start_time.elapsed();
+                    *status.lock().unwrap() = format!(
+                        "Exported {} samples to {:?} in {:.2}s",
+                        all_samples.len(),
+                        output_path.file_name().unwrap(),
+                        elapsed.as_secs_f32()
+                    );
+                }
+                Err(e) =>
+                {
+                    *status.lock().unwrap() = format!("Error exporting audio: {}", e);
+                    *export_progress.lock().unwrap() = None;
+                    return;
+                }
+            }
+        });
     }
 
 
@@ -440,7 +432,8 @@ impl CodecApp
                             self.test_sink = Some(sink);
                             self.is_testing = true;
                             self.update_status(format!("Playing test file: {:?}", path.file_name().unwrap()));
-                        } else 
+                        }
+                        else
                         {
                             self.update_status("Failed to open test file".to_string());
                         }
@@ -520,7 +513,8 @@ impl eframe::App for CodecApp
                             {
                                 self.test_audio_device();
                             }
-                        } else 
+                        }
+                        else
                         {
                             if ui.button("⏹ Stop Test").clicked() 
                             {
@@ -535,7 +529,8 @@ impl eframe::App for CodecApp
             ui.separator();
             
             // File selection section
-            ui.horizontal(|ui| {
+            ui.horizontal(|ui|
+            {
                 if ui.button("Select Audio Files (WAV/FLAC)").clicked() 
                 {
                     if let Some(paths) = rfd::FileDialog::new()
@@ -599,24 +594,24 @@ impl eframe::App for CodecApp
                 .id_source("encoded_files_scroll")
                 .max_height(120.0)
                 .show(ui, |ui| 
+            {
+                let mut files_to_add = Vec::new();
+                for (path, _) in &self.encoded_files
                 {
-                    let mut files_to_add = Vec::new();
-                    for (path, _) in &self.encoded_files 
+                    ui.horizontal(|ui|
                     {
-                        ui.horizontal(|ui| 
+                        ui.label(format!("{:?}", path.file_name().unwrap()));
+                        if ui.button(format!("Add##{:?}", path)).clicked()
                         {
-                            ui.label(format!("{:?}", path.file_name().unwrap()));
-                            if ui.button(format!("Add##{:?}", path)).clicked() 
-                            {
-                                files_to_add.push(path.clone());
-                            }
-                        });
-                    }
-                    for path in files_to_add 
-                    {
-                        self.playlist.push(path);
-                    }
-                });
+                            files_to_add.push(path.clone());
+                        }
+                    });
+                }
+                for path in files_to_add
+                {
+                    self.playlist.push(path);
+                }
+            });
             
             ui.separator();
             
@@ -626,24 +621,24 @@ impl eframe::App for CodecApp
                 .id_source("playlist_scroll")
                 .max_height(120.0)
                 .show(ui, |ui| 
+            {
+                let mut to_remove = None;
+                for (i, path) in self.playlist.iter().enumerate()
                 {
-                    let mut to_remove = None;
-                    for (i, path) in self.playlist.iter().enumerate() 
+                    ui.horizontal(|ui|
                     {
-                        ui.horizontal(|ui|
+                        ui.label(format!("{}. {:?}", i + 1, path.file_name().unwrap()));
+                        if ui.button(format!("Remove##{}", i)).clicked()
                         {
-                            ui.label(format!("{}. {:?}", i + 1, path.file_name().unwrap()));
-                            if ui.button(format!("Remove##{}", i)).clicked() 
-                            {
-                                to_remove = Some(i);
-                            }
-                        });
-                    }
-                    if let Some(idx) = to_remove 
-                    {
-                        self.playlist.remove(idx);
-                    }
-                });
+                            to_remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(idx) = to_remove
+                {
+                    self.playlist.remove(idx);
+                }
+            });
             
             ui.horizontal(|ui| 
             {
@@ -667,7 +662,8 @@ impl eframe::App for CodecApp
                     {
                         self.play_playlist_async();
                     }
-                } else 
+                }
+                else
                 {
                     if ui.button("⏹ Stop").clicked() 
                     {
@@ -675,15 +671,16 @@ impl eframe::App for CodecApp
                     }
                 }
 
-                #[cfg(feature = "flac-export")]
-                let button_text = "Export Playlist as FLAC";
-                #[cfg(feature = "flac-export")]
-                let default_filename = "output.flac";
+                // FLAC compression level selector
+                ui.horizontal(|ui|
+                {
+                    ui.label("FLAC Compression Level:");
+                    ui.add(egui::Slider::new(&mut self.flac_compression_level, 0..=8));
+                    ui.label(format!("{}", self.flac_compression_level));
+                });
 
-                #[cfg(not(feature = "flac-export"))]
-                let button_text = "Export Playlist as WAV";
-                #[cfg(not(feature = "flac-export"))]
-                let default_filename = "output.wav";
+                let button_text = "Export Playlist as FLAC";
+                let default_filename = "output.flac";
 
                 if ui.button(button_text).clicked()
                 {
@@ -717,7 +714,8 @@ impl eframe::App for CodecApp
             let detailed = self.detailed_status.lock().unwrap().clone();
             if !detailed.is_empty() 
             {
-                ui.horizontal(|ui| {
+                ui.horizontal(|ui|
+                {
                     ui.label("Details:");
                     ui.label(detailed);
                 });

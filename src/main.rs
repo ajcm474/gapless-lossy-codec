@@ -52,13 +52,11 @@ fn encode_file(input_path: PathBuf) -> Result<(), anyhow::Error>
 }
 
 /// Decode a GLC file to a lossless format (FLAC or WAV)
-fn decode_file(input_path: PathBuf) -> Result<(), anyhow::Error>
+fn decode_file(input_path: PathBuf, output_format: &str, flac_level: u8) -> Result<(), anyhow::Error>
 {
     use codec::{Decoder, load_encoded};
     use audio::export_to_wav;
-
-    #[cfg(feature = "flac-export")]
-    use audio::export_to_flac;
+    use flac::export_to_flac_with_level;
 
     println!("Loading: {:?}", input_path.file_name().unwrap());
 
@@ -80,51 +78,51 @@ fn decode_file(input_path: PathBuf) -> Result<(), anyhow::Error>
     // Generate output path
     let mut output_path = input_path.clone();
 
-    #[cfg(feature = "flac-export")]
+    match output_format
     {
-        output_path.set_extension("flac");
-        export_to_flac(
-            &output_path,
-            &samples,
-            encoded.header.sample_rate,
-            encoded.header.channels,
-        )?;
-        println!("Saved: {:?} (FLAC)", output_path.file_name().unwrap());
-    }
-
-    #[cfg(not(feature = "flac-export"))]
-    {
-        output_path.set_extension("wav");
-        export_to_wav(
-            &output_path,
-            &samples,
-            encoded.header.sample_rate,
-            encoded.header.channels,
-        )?;
-        println!("Saved: {:?} (WAV)", output_path.file_name().unwrap());
+        "flac" =>
+        {
+            output_path.set_extension("flac");
+            export_to_flac_with_level(
+                &output_path,
+                &samples,
+                encoded.header.sample_rate,
+                encoded.header.channels,
+                flac_level,
+            )?;
+            println!("Saved: {:?} (FLAC, level {})", output_path.file_name().unwrap(), flac_level);
+        }
+        "wav" =>
+        {
+            output_path.set_extension("wav");
+            export_to_wav(
+                &output_path,
+                &samples,
+                encoded.header.sample_rate,
+                encoded.header.channels,
+            )?;
+            println!("Saved: {:?} (WAV)", output_path.file_name().unwrap());
+        }
+        _ =>
+        {
+            return Err(anyhow::anyhow!("Unsupported output format: {}", output_format));
+        }
     }
 
     Ok(())
 }
 
-/// Play a GLC file using rodio (same as GUI playback)
+/// Play multiple GLC files gaplessly using rodio
 #[cfg(feature = "playback")]
-fn play_file(input_path: PathBuf) -> Result<(), anyhow::Error>
+fn play_files_gapless(file_paths: Vec<PathBuf>) -> Result<(), anyhow::Error>
 {
     use codec::{Decoder, load_encoded};
-    use rodio::{OutputStream, Sink, Source};
+    use rodio::{OutputStream, Sink};
 
-    println!("Loading: {:?}", input_path.file_name().unwrap());
-
-    // Load the encoded file
-    let encoded = load_encoded(&input_path)?;
-    let encoded = Arc::new(encoded);
-
-    let sample_rate = encoded.header.sample_rate;
-    let channels = encoded.header.channels;
-
-    println!("Playing: {} Hz, {} channels", sample_rate, channels);
-    println!("Press Ctrl+C to stop playback");
+    if file_paths.is_empty()
+    {
+        return Err(anyhow::anyhow!("No files to play"));
+    }
 
     // Create audio output stream
     let (_stream, stream_handle) = OutputStream::try_default()
@@ -133,29 +131,60 @@ fn play_file(input_path: PathBuf) -> Result<(), anyhow::Error>
     let sink = Sink::try_new(&stream_handle)
         .map_err(|e| anyhow::anyhow!("Failed to create audio sink: {}", e))?;
 
-    // Create decoder and get streaming receiver
-    let mut decoder = Decoder::new(channels as usize, sample_rate);
-    let rx = decoder.decode_streaming(encoded, None);
-
-    // Receive and play all chunks
-    while let Ok(chunk) = rx.recv()
+    // Load and queue all files
+    for path in &file_paths
     {
-        // Create a rodio Source from the chunk samples
-        let source = SamplesSource::new(chunk.samples.clone(), sample_rate, channels);
-        sink.append(source);
+        println!("Loading: {:?}", path.file_name().unwrap());
 
-        if chunk.is_last
+        let encoded = load_encoded(&path)?;
+        let encoded = Arc::new(encoded);
+
+        let sample_rate = encoded.header.sample_rate;
+        let channels = encoded.header.channels;
+
+        println!("Queueing: {} Hz, {} channels", sample_rate, channels);
+
+        // Create decoder and get streaming receiver
+        let mut decoder = Decoder::new(channels as usize, sample_rate);
+        let rx = decoder.decode_streaming(encoded, None);
+
+        // Receive and queue all chunks
+        while let Ok(chunk) = rx.recv()
         {
-            break;
+            let source = SamplesSource::new(chunk.samples.clone(), sample_rate, channels);
+            sink.append(source);
+
+            if chunk.is_last
+            {
+                break;
+            }
         }
     }
+
+    println!("Playing {} files gaplessly. Press Ctrl+C to stop.", file_paths.len());
 
     // Wait for playback to finish
     sink.sleep_until_end();
 
     println!("Playback finished");
-
     Ok(())
+}
+
+/// Play a single GLC file using rodio
+#[cfg(feature = "playback")]
+fn play_file(input_path: PathBuf) -> Result<(), anyhow::Error>
+{
+    play_files_gapless(vec![input_path])
+}
+
+/// Play files stub when playback feature is not available
+#[cfg(not(feature = "playback"))]
+fn play_files_gapless(_file_paths: Vec<PathBuf>) -> Result<(), anyhow::Error>
+{
+    eprintln!("Error: Playback support not compiled in");
+    eprintln!("Build with: cargo build --release --no-default-features --features playback");
+    eprintln!("Or run glc -p --ffplay <file.glc> to use ffplay instead");
+    Err(anyhow::anyhow!("Playback not available"))
 }
 
 /// Play file stub when playback feature is not available
@@ -204,11 +233,11 @@ fn play_file_with_ffplay(input_path: PathBuf) -> Result<(), anyhow::Error>
     {
         Ok(c) => c,
         Err(e) =>
-            {
-                eprintln!("Error: Failed to spawn ffplay: {}", e);
-                eprintln!("Make sure ffplay is installed and in your PATH");
-                return Err(e.into());
-            }
+        {
+            eprintln!("Error: Failed to spawn ffplay: {}", e);
+            eprintln!("Make sure ffplay is installed and in your PATH");
+            return Err(e.into());
+        }
     };
 
     let mut stdin = child.stdin.take().ok_or_else(||
@@ -298,20 +327,26 @@ fn is_glc_file(path: &PathBuf) -> bool
     false
 }
 
-/// Print usage information
 fn print_usage()
 {
     eprintln!("Usage:");
-    eprintln!("  glc <file.wav|file.flac> ...        Encode audio files to .glc");
-    eprintln!("  glc -d <file.glc> ...               Decode .glc files to lossless");
-    eprintln!("  glc -p <file.glc>                   Play .glc file");
-    eprintln!("  glc -p --ffplay <file.glc>          Play .glc file using ffplay");
-    eprintln!("  glc                                  Launch GUI (if available)");
+    eprintln!("  glc <file.wav|file.flac> ...                    Encode audio files to .glc");
+    eprintln!("  glc -d <file.glc> ... [--wav] [--flac-level N]  Decode .glc files");
+    eprintln!("  glc -p <file.glc> ... [--ffplay]                Play .glc files (gapless)");
+    eprintln!("  glc                                              Launch GUI (if ui feature enabled)");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  -d, --decode    Decode .glc files to FLAC (or WAV if FLAC export disabled)");
-    eprintln!("  -p, --play      Play .glc file using audio system (default)");
-    eprintln!("      --ffplay    Use ffplay for playback (with -p flag)");
+    eprintln!("  -d, --decode       Decode .glc files to FLAC (default) or WAV");
+    eprintln!("  -p, --play         Play .glc files using audio system (gapless for multiple files)");
+    eprintln!("      --ffplay       Use ffplay for playback (sequential for multiple files)");
+    eprintln!("      --wav          Output WAV format instead of FLAC");
+    eprintln!("      --flac-level   Set FLAC compression level 0-8 (default: 5)");
+    eprintln!();
+    eprintln!("Examples:");
+    eprintln!("  glc audio.wav                         # Encode to audio.glc");
+    eprintln!("  glc -d file1.glc file2.glc --wav      # Decode multiple files to WAV");
+    eprintln!("  glc -d file.glc --flac-level 8        # Decode with maximum FLAC compression");
+    eprintln!("  glc -p track1.glc track2.glc          # Play multiple files gaplessly");
     eprintln!();
     eprintln!("Supported formats: WAV, FLAC (input), GLC (decode/play)");
 }
@@ -336,33 +371,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>>
             }
 
             let mut has_errors = false;
+            let mut files_to_decode: Vec<PathBuf> = Vec::new();
+            let mut output_format = "flac";
+            let mut flac_level = 5u8;
+            let mut arg_idx = 2;
 
-            for arg in &args[2..]
+            // First pass: collect files and parse options
+            while arg_idx < args.len()
             {
-                let path = PathBuf::from(arg);
-
-                if !path.exists()
+                match args[arg_idx].as_str()
                 {
-                    eprintln!("Error: File not found: {:?}", path);
-                    has_errors = true;
-                    continue;
-                }
+                    "--wav" =>
+                    {
+                        output_format = "wav";
+                        arg_idx += 1;
+                    }
+                    "--flac-level" =>
+                    {
+                        if arg_idx + 1 >= args.len()
+                        {
+                            eprintln!("Error: --flac-level requires a value (0-8)");
+                            std::process::exit(1);
+                        }
+                        flac_level = args[arg_idx + 1].parse::<u8>().unwrap_or_else(|_| {
+                            eprintln!("Error: Invalid FLAC level, must be 0-8");
+                            std::process::exit(1);
+                        });
+                        if flac_level > 8
+                        {
+                            eprintln!("Error: FLAC level must be 0-8");
+                            std::process::exit(1);
+                        }
+                        arg_idx += 2;
+                    }
+                    _ =>
+                    {
+                        // This should be a file path
+                        let path = PathBuf::from(&args[arg_idx]);
 
-                if !is_glc_file(&path)
-                {
-                    eprintln!("Error: Not a .glc file: {:?}", path);
-                    has_errors = true;
-                    continue;
+                        if !path.exists()
+                        {
+                            eprintln!("Error: File not found: {:?}", path);
+                            has_errors = true;
+                        }
+                        else if !is_glc_file(&path)
+                        {
+                            eprintln!("Error: Not a .glc file: {:?}", path);
+                            has_errors = true;
+                        }
+                        else
+                        {
+                            files_to_decode.push(path);
+                        }
+                        arg_idx += 1;
+                    }
                 }
+            }
 
-                match decode_file(path)
+            if files_to_decode.is_empty()
+            {
+                eprintln!("Error: No valid .glc files to decode");
+                std::process::exit(1);
+            }
+
+            // Decode all files with the same settings
+            for path in files_to_decode
+            {
+                match decode_file(path, output_format, flac_level)
                 {
                     Ok(()) => {},
                     Err(e) =>
-                        {
-                            eprintln!("Error decoding file: {}", e);
-                            has_errors = true;
-                        }
+                    {
+                        eprintln!("Error decoding file: {}", e);
+                        has_errors = true;
+                    }
                 }
             }
 
@@ -377,49 +459,87 @@ fn main() -> Result<(), Box<dyn std::error::Error>>
         // Check for play flag
         if first_arg == "-p" || first_arg == "--play"
         {
-            // Check if --ffplay flag is present
-            let use_ffplay = args.len() >= 3 && (args[2] == "--ffplay");
-            let file_arg_idx = if use_ffplay { 3 } else { 2 };
-
-            if args.len() < file_arg_idx + 1
+            if args.len() < 3
             {
-                eprintln!("Error: -p requires exactly one .glc file");
+                eprintln!("Error: -p requires at least one .glc file");
                 print_usage();
                 std::process::exit(1);
             }
 
-            let path = PathBuf::from(&args[file_arg_idx]);
+            let mut use_ffplay = false;
+            let mut files_to_play: Vec<PathBuf> = Vec::new();
+            let mut arg_idx = 2;
 
-            if !path.exists()
+            // Parse play options and collect files
+            while arg_idx < args.len()
             {
-                eprintln!("Error: File not found: {:?}", path);
+                match args[arg_idx].as_str()
+                {
+                    "--ffplay" =>
+                    {
+                        use_ffplay = true;
+                        arg_idx += 1;
+                    }
+                    _ =>
+                    {
+                        let path = PathBuf::from(&args[arg_idx]);
+
+                        if !path.exists()
+                        {
+                            eprintln!("Error: File not found: {:?}", path);
+                            std::process::exit(1);
+                        }
+
+                        if !is_glc_file(&path)
+                        {
+                            eprintln!("Error: Not a .glc file: {:?}", path);
+                            std::process::exit(1);
+                        }
+
+                        files_to_play.push(path);
+                        arg_idx += 1;
+                    }
+                }
+            }
+
+            if files_to_play.is_empty()
+            {
+                eprintln!("Error: No valid .glc files to play");
                 std::process::exit(1);
             }
 
-            if !is_glc_file(&path)
+            // Play files
+            if use_ffplay
             {
-                eprintln!("Error: Not a .glc file: {:?}", path);
-                std::process::exit(1);
-            }
-
-            let result = if use_ffplay
-            {
-                play_file_with_ffplay(path)
+                // For ffplay, we need to play files sequentially
+                for path in files_to_play
+                {
+                    match play_file_with_ffplay(path)
+                    {
+                        Ok(()) => {},
+                        Err(e) =>
+                        {
+                            eprintln!("Error playing file: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
             }
             else
             {
-                play_file(path)
-            };
-
-            match result
-            {
-                Ok(()) => return Ok(()),
-                Err(e) =>
+                // For native playback, play gaplessly
+                match play_files_gapless(files_to_play)
+                {
+                    Ok(()) => {},
+                    Err(e) =>
                     {
-                        eprintln!("Error playing file: {}", e);
+                        eprintln!("Error playing files: {}", e);
                         std::process::exit(1);
                     }
+                }
             }
+
+            return Ok(());
         }
 
         // CLI mode: encode files
