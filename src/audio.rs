@@ -3,6 +3,7 @@ use anyhow::{anyhow, Result};
 use std::path::Path;
 use hound;
 use claxon;
+use crate::flac as pure_flac;
 
 #[cfg(feature = "flac-export")]
 use flac_bound::{FlacEncoder, WriteWrapper};
@@ -83,10 +84,10 @@ fn load_flac(path: &Path) -> Result<(Vec<f32>, u32, u16)>
     Ok((samples, info.sample_rate, info.channels as u16))
 }
 
-/// Export `samples` to `Path` using FLAC encoding
+/// Export `samples` to `Path` using FLAC encoding (old implementation using flac-bound)
 /// Uses 16-bit depth and a compression level of 5
 #[cfg(feature = "flac-export")]
-pub fn export_to_flac(
+pub fn export_to_flac_old(
     path: &Path,
     samples: &[f32],
     sample_rate: u32,
@@ -129,6 +130,19 @@ pub fn export_to_flac(
            .map_err(|e| anyhow!("Failed to finish FLAC encoding: {:?}", e))?;
 
     Ok(())
+}
+
+/// Export `samples` to `Path` using FLAC encoding (new pure Rust implementation)
+/// Uses 16-bit depth and a compression level of 5
+pub fn export_to_flac(
+    path: &Path,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+) -> Result<()>
+{
+    // Use the pure Rust FLAC encoder
+    pure_flac::export_to_flac(path, samples, sample_rate, channels)
 }
 
 /// Export `samples` to `Path` using WAV encoding (basically PCM with headers)

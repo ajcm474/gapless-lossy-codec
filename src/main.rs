@@ -2,6 +2,7 @@ mod codec;
 #[cfg(feature = "ui")]
 mod ui;
 mod audio;
+mod flac;
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
